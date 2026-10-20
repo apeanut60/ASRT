@@ -1,0 +1,33 @@
+stage: c
+out_dir: /root/data/experiments/ASRT/stage_c_huawei
+seed: 42
+max_steps: 30000
+total_steps: 30000
+batch_size: 1
+lr: 5.0e-6
+lr_backbone: 5.0e-6
+lr_inject: 2.0e-5
+lr_igab: 1.0e-5
+lr_illum: 1.0e-5
+eta_min: 1.0e-7
+amp: true
+grad_clip: 1.0
+crop: 192
+no_ref_prob: 0.0
+log_every: 50
+eval_every: 500
+save_every: 500
+eval_limit: 20
+workers: 2
+pretrained: /root/data/experiments/ASRT/stage_b/checkpoints/best.pt
+early_stop_patience: 5
+model:
+  num_res_blocks: "8+8+4+2"
+  n_feats: 64
+  freeze_lte: true
+  use_global_illum: false
+  use_ref_illum: false
+data:
+  # Budget: ~500 Nano triplets only — filled by audit_data / train from manifests
+  manifest: /root/data/experiments/ASRT/manifests/huawei_triplet.json
+  camera: Huawei

@@ -1,0 +1,38 @@
+stage: a
+out_dir: /root/data/experiments/ASRT/stage_a
+seed: 42
+max_steps: 80000
+total_steps: 80000
+batch_size: 1
+# effective batch 8 via grad accumulation if needed; smoke uses batch 1
+accum: 8
+lr: 2.0e-4
+eta_min: 1.0e-6
+betas: [0.9, 0.999]
+weight_decay: 0.0
+amp: true
+grad_clip: 1.0
+crop: 256
+crop_noref: 256
+# Syn uses 128 — train script sets domain-specific crop
+crop_syn: 128
+no_ref_prob: 1.0
+log_every: 50
+eval_every: 2000
+save_every: 2000
+eval_limit: 32
+workers: 2
+model:
+  num_res_blocks: "8+8+4+2"
+  n_feats: 64
+  freeze_lte: true
+  use_global_illum: false
+  use_ref_illum: false
+  enable_lightup: true
+data:
+  real_low: /root/data/datasets/lol-v2-real/Train/Low
+  real_gt: /root/data/datasets/lol-v2-real/Train/Normal
+  syn_low: /root/data/datasets/lol-v2-synthetic/Train/Low
+  syn_gt: /root/data/datasets/lol-v2-synthetic/Train/Normal
+  mix: [real, syn]
+  dev_frac: 0.05

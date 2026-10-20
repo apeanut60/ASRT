@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asrt"
+version = "0.1.0"
+description = "Illumination-Guided Cross-Scale Reference Restoration for Low-Light Image Enhancement"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+  "torch>=1.12",
+  "torchvision>=0.13",
+  "numpy>=1.21",
+  "Pillow>=9.0",
+  "PyYAML>=6.0",
+  "imageio>=2.19",
+  "tqdm>=4.64",
+  "opencv-python-headless>=4.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["asrt*"]
