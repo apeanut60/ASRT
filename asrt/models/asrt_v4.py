@@ -60,8 +60,28 @@ class ASRTv4(nn.Module):
         self.enable_v3 = False
         self.n_feats = int(n_feats)
         self.match_dim = int(match_dim)
+        if self.match_dim != self.n_feats:
+            raise ValueError(
+                'Current ASRT-v4 requires match_dim == n_feats '
+                '(got match_dim=%d, n_feats=%d). Separate Matching Q/K vs '
+                'restoration feature dims are not supported without explicit '
+                'value-projection modules.' % (self.match_dim, self.n_feats))
         self.d_clamp = float(d_clamp)
         self.eps = float(eps)
+        # Stash non-weight hyperparams for checkpoint consistency checks
+        self.v4_hparams = dict(
+            version='v4',
+            n_feats=self.n_feats,
+            num_res_blocks=num_res_blocks if not isinstance(num_res_blocks, list)
+            else '+'.join(str(x) for x in num_res_blocks),
+            enable_lightup=bool(enable_lightup),
+            match_dim=self.match_dim,
+            match_radius=int(match_radius),
+            match_temperature=float(match_temperature),
+            match_lambda_pos=float(match_lambda_pos),
+            ref_base_ch=int(ref_base_ch),
+            reli_mid=int(reli_mid),
+        )
         self.backbone = CSFIUNet(
             num_res_blocks=num_res_blocks,
             n_feats=n_feats,

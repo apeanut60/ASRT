@@ -31,6 +31,12 @@ workers: 2
 # Fresh warm-start from Stage A best @58k (do NOT resume broken stage_b_v4)
 pretrained: /root/data/experiments/ASRT/stage_a/checkpoints/best.pt
 pretrained_into_v4: true
+evaluation:
+  inference_mode: auto
+  full_max_side: 512
+  tile: 256
+  overlap: 32
+  input_range: minus_one_one
 model:
   version: v4
   enable_v4: true

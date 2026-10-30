@@ -12,6 +12,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
 
 from asrt.data.manifest import load_manifest  # noqa: E402
+from asrt.training.seed_utils import seed_everything  # noqa: E402
 from asrt.training.trainer import Trainer  # noqa: E402
 
 
@@ -118,6 +119,8 @@ def main():
         cfg['total_steps'] = a.max_steps
     if a.out_dir:
         cfg['out_dir'] = a.out_dir
+    # Seed before model/dataloader construction (Trainer also re-seeds)
+    seed_everything(int(cfg.get('seed', 42)))
     rows = resolve_rows(cfg)
     trainer = Trainer(cfg)
     pre = a.pretrained or cfg.get('pretrained') or ''
