@@ -44,13 +44,45 @@ def resolve_rows(cfg):
         return dict(train_rows_noref=noref, train_rows_ref=None, eval_rows=eval_rows)
 
     if stage in ('b', 'stage_b'):
-        ref = load('lolv2_real_triplet_train.json') + load('lolv2_syn_triplet_train.json')
-        noref = load('lolv2_real_paired_train.json') + load('lolv2_syn_paired_train.json')
-        # Prefer ref-capable unified Dev; fallback to paired_dev name if present.
-        try:
-            eval_rows = load('lolv2_real_triplet_dev.json')
-        except SystemExit:
-            eval_rows = load('lolv2_real_paired_dev.json')
+        domain = str(data.get('domain', 'all')).lower()
+        if domain in ('syn', 'synthetic'):
+            ref = load('lolv2_syn_triplet_train.json')
+            noref = load('lolv2_syn_paired_train.json')
+            try:
+                eval_rows = load('lolv2_syn_triplet_dev.json')
+            except SystemExit:
+                eval_rows = load('lolv2_syn_paired_dev.json')
+        elif domain in ('mit', 'fivek', 'mit_test'):
+            ref = load('mit_triplet_train.json')
+            noref = load('mit_paired_train.json')
+            try:
+                eval_rows = load('mit_triplet_dev.json')
+            except SystemExit:
+                eval_rows = load('mit_paired_dev.json')
+        elif domain in ('real',):
+            ref = load('lolv2_real_triplet_train.json')
+            noref = load('lolv2_real_paired_train.json')
+            try:
+                eval_rows = load('lolv2_real_triplet_dev.json')
+            except SystemExit:
+                eval_rows = load('lolv2_real_paired_dev.json')
+        else:
+            ref = load('lolv2_real_triplet_train.json') + load('lolv2_syn_triplet_train.json')
+            noref = load('lolv2_real_paired_train.json') + load('lolv2_syn_paired_train.json')
+            # Prefer ref-capable unified Dev; fallback to paired_dev name if present.
+            try:
+                eval_rows = load('lolv2_real_triplet_dev.json')
+            except SystemExit:
+                eval_rows = load('lolv2_real_paired_dev.json')
+        for r in ref + noref + eval_rows:
+            if str(r.get('domain', '')).lower() == 'mit' or '/MIT/' in str(
+                    r.get('low_path', '')):
+                r['domain'] = 'mit'
+            elif 'syn' in str(r.get('domain', '')).lower() or 'synthetic' in str(
+                    r.get('low_path', '')).lower():
+                r['domain'] = 'syn'
+            elif not r.get('domain'):
+                r['domain'] = 'real'
         return dict(train_rows_ref=ref, train_rows_noref=noref, eval_rows=eval_rows)
 
     # Stage C

@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from asrt.data.paired import PairedRestoreDataset
 from asrt.data.triplet import TripletRefDataset, collate_skip_none_ref
 from asrt.evaluation.metrics import psnr_ssim_rgb
-from asrt.models.asrt import ASRT, build_asrt, load_b_v2_into_v3
+from asrt.models.asrt import ASRT, build_asrt, load_pretrained_into_v3
 from asrt.training.optimizer import build_optimizer
 from asrt.training.scheduler import build_scheduler
 
@@ -112,9 +112,10 @@ class Trainer:
         state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
         if (getattr(self.model, 'enable_v3', False)
                 and not resume_optim
-                and bool(self.cfg.get('pretrained_is_b_v2', True))):
-            info = load_b_v2_into_v3(self.model, state)
-            print('v3 warm-start from B-v2: loaded=%d missing_new=%d' % (
+                and bool(self.cfg.get('pretrained_into_v3',
+                                      self.cfg.get('pretrained_is_b_v2', True)))):
+            info = load_pretrained_into_v3(self.model, state)
+            print('v3 warm-start from pretrained: loaded=%d missing_new=%d' % (
                 info['loaded'], len(info['missing'])), flush=True)
         else:
             self.model.load_state_dict(state, strict=True)

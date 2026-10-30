@@ -1,0 +1,52 @@
+# MIT testing-as-train joint v3 (no official MIT test scores).
+stage: b
+out_dir: /root/data/experiments/ASRT/joint_mit_v3
+seed: 42
+max_steps: 100000
+total_steps: 100000
+batch_size: 8
+accum: 1
+lr: 1.0e-5
+lr_backbone: 1.0e-5
+lr_inject: 1.0e-4
+lr_igab: 2.0e-5
+lr_illum: 2.0e-5
+lr_v3: 1.0e-4
+eta_min: 1.0e-6
+amp: true
+grad_clip: 1.0
+crop: 192
+crop_syn: 192
+crop_noref: 192
+no_ref_prob: 0.25
+stable_steps: 2000
+teacher_consistency_weight: 0.1
+teacher_ckpt: /root/data/experiments/ASRT/stage_a/checkpoints/best.pt
+log_every: 50
+eval_every: 2000
+save_every: 2000
+eval_limit: 0
+workers: 2
+pretrained: /root/data/experiments/ASRT/stage_a/checkpoints/best.pt
+pretrained_into_v3: true
+pretrained_is_b_v2: true
+model:
+  num_res_blocks: "8+8+4+2"
+  n_feats: 64
+  freeze_lte: true
+  use_global_illum: false
+  use_ref_illum: false
+  enable_lightup: true
+  enable_v3: true
+query_alignment:
+  enabled: true
+  method: gamma_hist
+  gamma_alpha: 0.75
+  hist_beta: 0.50
+  gamma_min: 0.3
+  gamma_max: 1.0
+  hist_bins: 256
+  stats_scope: full_image
+data:
+  domain: mit
+  manifest_root: /root/data/experiments/ASRT/manifests_mit_joint

@@ -228,15 +228,17 @@ def build_asrt(cfg: Optional[dict] = None) -> ASRT:
     )
 
 
-def load_b_v2_into_v3(model: ASRT, state: dict) -> dict:
-    """Load B-v2 weights into v3. Missing keys must be new-only; no old key skipped."""
+def load_pretrained_into_v3(model: ASRT, state: dict) -> dict:
+    """Load Stage A / B-v2 (non-v3) weights into v3.
+
+    Every key in the checkpoint must exist in the v3 model with matching shape.
+    Allowed missing keys in the *model* are new v3 modules only.
+    """
     if not isinstance(state, dict):
         raise ValueError('state must be a state_dict')
-    # Unwrap checkpoint envelope
     if 'model' in state and isinstance(state['model'], dict):
         state = state['model']
     model_sd = model.state_dict()
-    # Every B-v2 key must exist in v3 with matching shape
     skipped_old = []
     shape_mismatch = []
     for k, v in state.items():
@@ -246,23 +248,14 @@ def load_b_v2_into_v3(model: ASRT, state: dict) -> dict:
             shape_mismatch.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
     if skipped_old:
         raise RuntimeError(
-            'B-v2 keys missing in v3 model (cannot skip old trunk): %s' % skipped_old[:20])
+            'pretrained keys missing in v3 model (cannot skip old trunk): %s'
+            % skipped_old[:20])
     if shape_mismatch:
-        raise RuntimeError('shape mismatch loading B-v2: %s' % shape_mismatch[:10])
+        raise RuntimeError('shape mismatch loading pretrained: %s' % shape_mismatch[:10])
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     if unexpected:
-        raise RuntimeError('unexpected keys from B-v2 ckpt: %s' % list(unexpected)[:20])
-    # Allowed missing: new v3 modules only
-    allowed_prefixes = (
-        'reliability.',
-        'backbone.coarse_illum_adapter.',
-        'backbone.middle_illum_adapter.',
-        'backbone.fine_ct_refine.',
-        # CondResBlock adapter (last RB replaced)
-        'backbone.RB11.',  # may include .adapter. — filter below
-        'backbone.RB22.',
-    )
+        raise RuntimeError('unexpected keys from pretrained ckpt: %s' % list(unexpected)[:20])
     bad_missing = []
     for k in missing:
         if k.startswith('reliability.'):
@@ -273,7 +266,6 @@ def load_b_v2_into_v3(model: ASRT, state: dict) -> dict:
             continue
         if k.startswith('backbone.fine_ct_refine.'):
             continue
-        # CondResBlock adapter only
         if ('.adapter.' in k) and (
                 k.startswith('backbone.RB11.') or k.startswith('backbone.RB22.')):
             continue
@@ -282,3 +274,8 @@ def load_b_v2_into_v3(model: ASRT, state: dict) -> dict:
         raise RuntimeError(
             'unexpected missing keys (not new v3 modules): %s' % bad_missing[:30])
     return dict(missing=list(missing), unexpected=list(unexpected), loaded=len(state))
+
+
+def load_b_v2_into_v3(model: ASRT, state: dict) -> dict:
+    """Alias for load_pretrained_into_v3 (backward compatible name)."""
+    return load_pretrained_into_v3(model, state)
