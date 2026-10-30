@@ -16,12 +16,23 @@ from asrt.data.paired import PairedRestoreDataset
 from asrt.data.triplet import TripletRefDataset, collate_skip_none_ref
 from asrt.evaluation.metrics import psnr_ssim_rgb
 from asrt.models.asrt import ASRT, build_asrt, load_pretrained_into_v3
+from asrt.models.asrt_v4 import ASRTv4, build_asrt_v4, load_stage_a_into_v4
 from asrt.training.optimizer import build_optimizer
 from asrt.training.scheduler import build_scheduler
 
 
 def l1_loss(pred, gt):
     return F.l1_loss(pred, gt)
+
+
+def _is_v4_cfg(cfg: dict, model_cfg: dict) -> bool:
+    if bool(model_cfg.get('enable_v4', False)):
+        return True
+    ver = str(model_cfg.get('version', '')).lower()
+    if ver in ('v4', 'asrt_v4', 'asrt-v4'):
+        return True
+    stage = str(cfg.get('stage', '')).lower()
+    return stage in ('b_v4', 'stage_b_v4', 'v4')
 
 
 class Trainer:
@@ -32,7 +43,11 @@ class Trainer:
         # Top-level query_alignment merges into model.query_align
         if cfg.get('query_alignment') is not None:
             model_cfg['query_align'] = dict(cfg['query_alignment'])
-        self.model = build_asrt(model_cfg).to(self.device)
+        self.is_v4 = _is_v4_cfg(cfg, model_cfg)
+        if self.is_v4:
+            self.model = build_asrt_v4(model_cfg).to(self.device)
+        else:
+            self.model = build_asrt(model_cfg).to(self.device)
         self.opt = build_optimizer(self.model, cfg)
         self.sched = build_scheduler(self.opt, cfg)
         self.scaler = GradScaler(enabled=bool(cfg.get('amp', True)) and self.device == 'cuda')
@@ -44,13 +59,15 @@ class Trainer:
         self.log_f = None
         self.best = None
         self.no_ref_prob = float(cfg.get('no_ref_prob', 0.0))
+        self.lambda_no_ref = float(cfg.get('lambda_no_ref', 0.0))
+        self.dual_forward = bool(cfg.get('dual_forward', self.is_v4))
         self.teacher_w = float(cfg.get('teacher_consistency_weight', 0.0))
         self.stable_steps = int(cfg.get('stable_steps', 0))
         self._base_lrs = [float(g['lr']) for g in self.opt.param_groups]
         self.teacher = None
         t_ckpt = cfg.get('teacher_ckpt') or ''
-        if self.teacher_w > 0 and t_ckpt and os.path.isfile(t_ckpt):
-            # Frozen Stage-A teacher (no v3); eval mode forever
+        if (not self.is_v4) and self.teacher_w > 0 and t_ckpt and os.path.isfile(t_ckpt):
+            # Frozen Stage-A teacher (no v3); eval mode forever — not used for v4
             t_cfg = dict(model_cfg)
             t_cfg['enable_v3'] = False
             self.teacher = build_asrt(t_cfg).to(self.device)
@@ -63,14 +80,15 @@ class Trainer:
             print('teacher loaded from %s (w=%.3f)' % (t_ckpt, self.teacher_w), flush=True)
 
     def _apply_stable_lrs(self):
-        """During stable_steps: keep v3_new LR, zero other group LRs."""
+        """During stable_steps: keep v3_new/v4_new LR, zero other group LRs."""
         if self.stable_steps <= 0:
             return
         in_stable = self.step < self.stable_steps
         if not in_stable:
             return
+        keep = {'v3_new', 'v4_new'}
         for g, base in zip(self.opt.param_groups, self._base_lrs):
-            if g.get('name') == 'v3_new':
+            if g.get('name') in keep:
                 g['lr'] = base
             else:
                 g['lr'] = 0.0
@@ -110,7 +128,18 @@ class Trainer:
     def load(self, path: str, resume_optim: bool = True):
         ck = torch.load(path, map_location=self.device)
         state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
-        if (getattr(self.model, 'enable_v3', False)
+        if (self.is_v4 and isinstance(self.model, ASRTv4) and not resume_optim
+                and bool(self.cfg.get('pretrained_into_v4', True))):
+            info = load_stage_a_into_v4(self.model, state)
+            print(
+                'v4 warm-start from Stage A: loaded=%d new=%d unused_ckpt=%d'
+                % (info['loaded'], len(info['expected_new']), len(info['unused_ckpt'])),
+                flush=True)
+            report_path = os.path.join(self.out_dir, 'stage_a_load_report.json')
+            with open(report_path, 'w') as f:
+                json.dump(info, f, indent=2)
+            print('load report → %s' % report_path, flush=True)
+        elif (getattr(self.model, 'enable_v3', False)
                 and not resume_optim
                 and bool(self.cfg.get('pretrained_into_v3',
                                       self.cfg.get('pretrained_is_b_v2', True)))):
@@ -262,16 +291,33 @@ class Trainer:
             self._apply_stable_lrs()
 
             teacher_l = 0.0
+            loss_ref_v = 0.0
+            loss_noref_v = 0.0
             with autocast(enabled=self.scaler.is_enabled()):
-                pred = self.model(low, ref=ref, query_gamma=qg, query_lut=ql)
-                loss = l1_loss(pred, gt)
-                if (self.teacher is not None and self.teacher_w > 0
-                        and (not use_ref or ref is None)):
-                    with torch.no_grad():
-                        t_pred = self.teacher(low, ref=None)
-                    t_loss = l1_loss(pred, t_pred)
-                    loss = loss + self.teacher_w * t_loss
-                    teacher_l = float(t_loss.detach())
+                if self.dual_forward and use_ref and ref is not None:
+                    # ASRT-v4: same Low/GT with and without reference
+                    pred_ref = self.model(low, ref=ref, query_gamma=qg, query_lut=ql)
+                    aux_ref = getattr(self.model, 'last_aux', None)
+                    pred_noref = self.model(low, ref=None)
+                    # Keep ref-path diagnostics for logging (no-ref overwrites last_aux)
+                    if aux_ref is not None:
+                        self.model.last_aux = aux_ref
+                    loss_ref = l1_loss(pred_ref, gt)
+                    loss_noref = l1_loss(pred_noref, gt)
+                    loss = loss_ref + self.lambda_no_ref * loss_noref
+                    loss_ref_v = float(loss_ref.detach())
+                    loss_noref_v = float(loss_noref.detach())
+                    pred = pred_ref
+                else:
+                    pred = self.model(low, ref=ref, query_gamma=qg, query_lut=ql)
+                    loss = l1_loss(pred, gt)
+                    if (self.teacher is not None and self.teacher_w > 0
+                            and (not use_ref or ref is None)):
+                        with torch.no_grad():
+                            t_pred = self.teacher(low, ref=None)
+                        t_loss = l1_loss(pred, t_pred)
+                        loss = loss + self.teacher_w * t_loss
+                        teacher_l = float(t_loss.detach())
                 loss = loss / float(accum)
                 if not torch.isfinite(loss):
                     raise SystemExit('non-finite loss at step %d' % self.step)
@@ -305,6 +351,9 @@ class Trainer:
                     lr=lr, lr_groups=lr_map, gnorm=float(gnorm),
                     used_ref=bool(use_ref),
                     teacher_l1=teacher_l,
+                    loss_ref=loss_ref_v,
+                    loss_noref=loss_noref_v,
+                    lambda_no_ref=self.lambda_no_ref if self.dual_forward else 0.0,
                     stable=bool(self.step <= self.stable_steps),
                     peak_mem_mb=peak_mem, clip_events=clipped,
                     accum=accum, effective_batch=eff_batch,
@@ -313,8 +362,12 @@ class Trainer:
                 if aux.get('c_t_stats'):
                     row['c_t'] = aux['c_t_stats']
                     row['c_l'] = aux['c_l_stats']
+                if aux.get('match'):
+                    row['match'] = aux['match']
                 if aux.get('v3') and aux['v3'].get('inject_res_norm'):
                     row['inject_res_norm'] = aux['v3']['inject_res_norm']
+                if aux.get('v4') and aux['v4'].get('tex_res_norm'):
+                    row['tex_res_norm'] = aux['v4']['tex_res_norm']
                 self.log_f.write(json.dumps(row) + '\n')
                 self.log_f.flush()
                 print('step %d/%d loss=%.4f lr=%.2e ref=%s accum=%d mem=%.0fMB' % (

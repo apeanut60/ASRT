@@ -43,7 +43,7 @@ def resolve_rows(cfg):
         eval_rows = load('lolv2_real_paired_dev.json')
         return dict(train_rows_noref=noref, train_rows_ref=None, eval_rows=eval_rows)
 
-    if stage in ('b', 'stage_b'):
+    if stage in ('b', 'stage_b', 'b_v4', 'stage_b_v4', 'v4'):
         domain = str(data.get('domain', 'all')).lower()
         if domain in ('syn', 'synthetic'):
             ref = load('lolv2_syn_triplet_train.json')

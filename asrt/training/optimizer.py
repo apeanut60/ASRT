@@ -1,4 +1,4 @@
-"""Adam param groups for Stage A/B/C / v3."""
+"""Adam param groups for Stage A/B/C / v3 / v4."""
 from __future__ import annotations
 
 import torch
@@ -14,9 +14,10 @@ def build_optimizer(model, cfg: dict):
         params = [p for p in model.parameters() if p.requires_grad]
         return torch.optim.Adam(params, lr=base_lr, betas=betas, weight_decay=wd)
 
-    # Stage B/C/v3: grouped LRs
+    # Stage B/C/v3/v4: grouped LRs
     backbone = model.backbone
     assigned = set()
+    is_v4 = bool(getattr(model, 'is_v4', False) or getattr(backbone, 'enable_v4', False))
 
     def take(params):
         out = []
@@ -30,6 +31,27 @@ def build_optimizer(model, cfg: dict):
         return out
 
     groups = []
+
+    # --- new v4 modules (higher LR) ---
+    if is_v4:
+        v4_params = []
+        for name in ('ref_encoder', 'matcher', 'reliability', 'lpf',
+                     'low_q_proj', 'illum_q_proj'):
+            mod = getattr(model, name, None)
+            if mod is not None and not isinstance(mod, torch.nn.Identity):
+                v4_params += list(mod.parameters())
+        for mod_name in (
+                'tex_adapt_h4', 'tex_adapt_h2', 'tex_adapt_h1',
+                'illum_adapt_h4', 'illum_adapt_h2'):
+            mod = getattr(backbone, mod_name, None)
+            if mod is not None:
+                v4_params += list(mod.parameters())
+        v4_params = take(v4_params)
+        if v4_params:
+            groups.append(dict(
+                params=v4_params,
+                lr=float(cfg.get('lr_v4', cfg.get('lr_v3', 1e-4))),
+                name='v4_new'))
 
     # --- new v3 modules (higher LR) ---
     v3_params = []
@@ -55,7 +77,7 @@ def build_optimizer(model, cfg: dict):
                 lr=float(cfg.get('lr_v3', 1e-4)),
                 name='v3_new'))
 
-    # trunk (exclude inject / illum / igab / merge / v3 adapters already taken)
+    # trunk (exclude inject / illum / igab / merge / v3/v4 adapters already taken)
     trunk = []
     for name, p in backbone.named_parameters():
         if not p.requires_grad or id(p) in assigned:
@@ -64,7 +86,7 @@ def build_optimizer(model, cfg: dict):
                 'conv11_head', 'conv22_head', 'conv33_head',
                 'illumination_estimator', 'coarse_igab', 'middle_igab',
                 'merge_tail', 'coarse_illum_adapter', 'middle_illum_adapter',
-                'fine_ct_refine')):
+                'fine_ct_refine', 'tex_adapt_', 'illum_adapt_')):
             continue
         # CondResBlock.adapter already taken
         if '.adapter.' in name:
@@ -90,12 +112,12 @@ def build_optimizer(model, cfg: dict):
         params=take(illum),
         lr=float(cfg.get('lr_illum', 2e-5)), name='illum_tail'))
 
-    # Catch-all: any remaining trainable (should be empty or LTE if unfrozen)
+    # Catch-all: any remaining trainable (LTE if unfrozen, or stray v4)
     leftover = take([p for p in model.parameters() if p.requires_grad])
     if leftover:
         groups.append(dict(
             params=leftover,
-            lr=float(cfg.get('lr_v3', cfg.get('lr_backbone', 1e-5))),
+            lr=float(cfg.get('lr_v4', cfg.get('lr_v3', cfg.get('lr_backbone', 1e-5)))),
             name='other'))
 
     groups = [g for g in groups if len(g['params']) > 0]

@@ -13,6 +13,8 @@ from asrt.models.cond_resblock import CondResBlock
 from asrt.models.illumination_prior import IlluminationAdapter
 from asrt.models.legacy_heads import GlobalIllumHead, RefIllumTransfer
 from asrt.models.reliability import FineCTRefine
+from asrt.models.v4_adapters import IlluminationAdapter as IllumAdapterV4
+from asrt.models.v4_adapters import TextureAdapter
 
 
 def conv1x1(in_ch, out_ch, stride=1):
@@ -144,17 +146,21 @@ class CSFIUNet(nn.Module):
         use_ref_illum=False,
         ref_illum_pool=8,
         enable_v3: bool = False,
+        enable_v4: bool = False,
     ):
         super().__init__()
         blocks = parse_num_res_blocks(num_res_blocks)
         if n_feats % igab_heads:
             raise ValueError('n_feats must be divisible by igab_heads')
+        if enable_v3 and enable_v4:
+            raise ValueError('enable_v3 and enable_v4 are mutually exclusive')
         self.num_res_blocks = blocks
         self.n_feats = n_feats
         self.enable_lightup = enable_lightup
         self.use_global_illum = bool(use_global_illum)
         self.use_ref_illum = bool(use_ref_illum)
         self.enable_v3 = bool(enable_v3)
+        self.enable_v4 = bool(enable_v4)
 
         self.SFE = SFE(blocks[0], n_feats, res_scale)
         self.down1 = nn.Sequential(conv3x3(n_feats, n_feats, stride=2), nn.LeakyReLU(0.1))
@@ -206,9 +212,23 @@ class CSFIUNet(nn.Module):
             self.middle_illum_adapter = IlluminationAdapter(n_feats)
             self.fine_ct_refine = FineCTRefine()
 
+        # ASRT-v4: TextureAdapters + IllumAdapters; keep plain ResBlocks / IGAB.
+        self.tex_adapt_h4 = None
+        self.tex_adapt_h2 = None
+        self.tex_adapt_h1 = None
+        self.illum_adapt_h4 = None
+        self.illum_adapt_h2 = None
+        if self.enable_v4:
+            self.tex_adapt_h4 = TextureAdapter(n_feats)
+            self.tex_adapt_h2 = TextureAdapter(n_feats)
+            self.tex_adapt_h1 = TextureAdapter(n_feats)
+            self.illum_adapt_h4 = IllumAdapterV4(n_feats)
+            self.illum_adapt_h2 = IllumAdapterV4(n_feats)
+
         self.last_gate = None
         self.last_used_reference = False
         self.last_v3_diag = None
+        self.last_v4_diag = None
 
     @staticmethod
     def safe_pad(x, target_hw):
@@ -248,6 +268,16 @@ class CSFIUNet(nn.Module):
             residual = ct * residual
         return feat + residual, residual
 
+    def _tex_correct(self, feat, T, c_t, adapter):
+        """Reliability-aware texture correction: F + C_T * delta(F,T)."""
+        if adapter is None or T is None or c_t is None:
+            return feat, None
+        T = self._align_ref(T, feat, 'T_v4')
+        ct = resize_like(c_t, feat)
+        before = feat
+        out = adapter(feat, T, ct)
+        return out, out - before
+
     def _run_rbs(self, feat, rbs, tail, l_guided=None, c_l=None):
         start = feat
         for rb in rbs:
@@ -256,6 +286,31 @@ class CSFIUNet(nn.Module):
             else:
                 feat = rb(feat)
         return start + tail(feat)
+
+    def encode_low_stem(self, x):
+        """Pad + illum + SFE + downs. Used by ASRTv4 for Query features."""
+        orig_hw = x.shape[-2:]
+        th = int(math.ceil(orig_hw[0] / 4.0) * 4)
+        tw = int(math.ceil(orig_hw[1] / 4.0) * 4)
+        low = self.safe_pad(x, (th, tw))
+        low01 = (low + 1.) * 0.5
+        illu_h, log_gain = self.illumination_estimator(low01)
+        if self.enable_lightup:
+            lightup = low01 * torch.exp(log_gain.clamp(-1.5, 1.5))
+            base = 2. * lightup - 1.
+        else:
+            base = low
+        e0 = self.SFE(low)
+        e1 = self.down1(e0)
+        e2 = self.down2(e1)
+        illu_h2 = resize_like(illu_h, e1)
+        illu_h4 = resize_like(illu_h, e2)
+        return dict(
+            low=low, low01=low01, base=base, orig_hw=orig_hw,
+            e0=e0, e1=e1, e2=e2,
+            illu_h=illu_h, illu_h2=illu_h2, illu_h4=illu_h4,
+            log_gain=log_gain,
+        )
 
     def forward(
         self,
@@ -269,44 +324,39 @@ class CSFIUNet(nn.Module):
         c_t=None,
         c_l=None,
         illum_prior=None,
+        stem: Optional[dict] = None,
     ):
         """
         Args:
             x: Low RGB in [-1, 1]
-            S/T_*: SearchTransfer outputs; ignored when use_reference is False
-            use_reference: if None, inferred as (S is not None and all T present)
-            c_t / c_l: reliability maps [B,1,H/4,W/4] (v3)
-            illum_prior: dict with p_ref_matched / p_base / d_ref at H/4 (v3)
+            S/T_*: SearchTransfer outputs (legacy/v3); ignored when use_reference is False
+            use_reference: if None, inferred from available tensors
+            c_t / c_l: reliability maps [B,1,H/4,W/4]
+            illum_prior: dict with p_ref_matched / p_base / d_ref
+            stem: optional precomputed encode_low_stem (v4 shares Query stem)
         """
         if use_reference is None:
             use_reference = (
-                S is not None and T_lv3 is not None
-                and T_lv2 is not None and T_lv1 is not None)
+                (T_lv3 is not None and T_lv2 is not None and T_lv1 is not None)
+                and (S is not None or self.enable_v4))
         self.last_used_reference = bool(use_reference)
         use_v3 = bool(
             self.enable_v3 and use_reference and c_t is not None and c_l is not None
             and illum_prior is not None)
+        use_v4 = bool(
+            self.enable_v4 and use_reference and c_t is not None and c_l is not None
+            and illum_prior is not None
+            and T_lv3 is not None and T_lv2 is not None and T_lv1 is not None)
 
-        orig_hw = x.shape[-2:]
-        th = int(math.ceil(orig_hw[0] / 4.0) * 4)
-        tw = int(math.ceil(orig_hw[1] / 4.0) * 4)
-        low = self.safe_pad(x, (th, tw))
+        if stem is None:
+            stem = self.encode_low_stem(x)
+        low = stem['low']
+        base = stem['base']
+        orig_hw = stem['orig_hw']
+        e0, e1, e2 = stem['e0'], stem['e1'], stem['e2']
+        illu_h2, illu_h4 = stem['illu_h2'], stem['illu_h4']
 
-        low01 = (low + 1.) * 0.5
-        illu_h, log_gain = self.illumination_estimator(low01)
-        if self.enable_lightup:
-            lightup = low01 * torch.exp(log_gain.clamp(-1.5, 1.5))
-            base = 2. * lightup - 1.
-        else:
-            base = low
-
-        e0 = self.SFE(low)
-        e1 = self.down1(e0)
-        e2 = self.down2(e1)
-        illu_h2 = resize_like(illu_h, e1)
-        illu_h4 = resize_like(illu_h, e2)
-
-        # Guided illumination (v3): L_guided = L_low + C_L * DeltaL_ref
+        # Guided illumination
         l_guided_h4 = illu_h4
         l_guided_h2 = illu_h2
         delta_c = delta_m = None
@@ -325,15 +375,30 @@ class CSFIUNet(nn.Module):
                 illum_prior['d_ref'],
                 c_l,
             )
+        elif use_v4:
+            l_guided_h4 = self.illum_adapt_h4(
+                illu_h4, illum_prior['p_ref_matched'],
+                illum_prior['d_ref'], c_l)
+            l_guided_h2 = self.illum_adapt_h2(
+                illu_h2, illum_prior['p_ref_matched'],
+                illum_prior['d_ref'], c_l)
+            delta_c = l_guided_h4 - illu_h4
+            delta_m = l_guided_h2 - illu_h2
 
-        c_t_h4 = c_t if use_v3 else None
-        c_t_h2 = resize_like(c_t, e1) if use_v3 else None
+        c_t_h4 = c_t if (use_v3 or use_v4) else None
+        c_t_h2 = resize_like(c_t, e1) if (use_v3 or use_v4) else None
         c_t_h1 = None
         if use_v3:
             c_t_up = resize_like(c_t, e0)
             c_t_h1 = self.fine_ct_refine(c_t_up, low)
+        elif use_v4:
+            c_t_h1 = resize_like(c_t, e0)
 
-        x11, res11 = self._inject(e2, T_lv3, S, self.conv11_head, use_reference, c_t_h4)
+        res11 = res22 = res33 = None
+        if use_v4:
+            x11, res11 = self._tex_correct(e2, T_lv3, c_t_h4, self.tex_adapt_h4)
+        else:
+            x11, res11 = self._inject(e2, T_lv3, S, self.conv11_head, use_reference, c_t_h4)
         x11 = self._run_rbs(
             x11, self.RB11, self.conv11_tail,
             l_guided=l_guided_h4 if use_v3 else None,
@@ -342,7 +407,10 @@ class CSFIUNet(nn.Module):
 
         x21 = x11
         x22 = self.skip_e1(torch.cat([resize_like(x11, e1), e1], dim=1))
-        x22, res22 = self._inject(x22, T_lv2, S, self.conv22_head, use_reference, c_t_h2)
+        if use_v4:
+            x22, res22 = self._tex_correct(x22, T_lv2, c_t_h2, self.tex_adapt_h2)
+        else:
+            x22, res22 = self._inject(x22, T_lv2, S, self.conv22_head, use_reference, c_t_h2)
         x21, x22 = self.ex12(x21, x22)
         x21 = self._run_rbs(x21, self.RB21, self.conv21_tail)
         x22 = self._run_rbs(
@@ -353,7 +421,10 @@ class CSFIUNet(nn.Module):
 
         x31, x32 = x21, x22
         x33 = self.skip_e0(torch.cat([resize_like(x22, e0), e0], dim=1))
-        x33, res33 = self._inject(x33, T_lv1, S, self.conv33_head, use_reference, c_t_h1)
+        if use_v4:
+            x33, res33 = self._tex_correct(x33, T_lv1, c_t_h1, self.tex_adapt_h1)
+        else:
+            x33, res33 = self._inject(x33, T_lv1, S, self.conv33_head, use_reference, c_t_h1)
         x31, x32, x33 = self.ex123(x31, x32, x33)
         x31 = self._run_rbs(x31, self.RB31, self.conv31_tail)
         x32 = self._run_rbs(x32, self.RB32, self.conv32_tail)
@@ -385,4 +456,20 @@ class CSFIUNet(nn.Module):
             )
         else:
             self.last_v3_diag = None
+        if use_v4:
+            self.last_v4_diag = dict(
+                c_t=c_t.detach(),
+                c_l=c_l.detach(),
+                delta_l_coarse=None if delta_c is None else delta_c.detach(),
+                delta_l_middle=None if delta_m is None else delta_m.detach(),
+                tex_res_norm=dict(
+                    coarse=float(res11.detach().norm()) if res11 is not None else 0.0,
+                    middle=float(res22.detach().norm()) if res22 is not None else 0.0,
+                    fine=float(res33.detach().norm()) if res33 is not None else 0.0,
+                ),
+                l_guided_diff=float((l_guided_h4 - illu_h4).detach().norm()),
+                base=base.detach(),
+            )
+        else:
+            self.last_v4_diag = None
         return out

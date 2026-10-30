@@ -35,12 +35,27 @@ def infer_full(model, low, ref=None):
     return model(low, ref=ref, return_aux=False)
 
 
+def _v4_match_halo(model) -> int:
+    """Extra context for local soft matching + shallow encoder RF (pixels)."""
+    if not bool(getattr(model, 'is_v4', False)):
+        return 0
+    radius = 4
+    matcher = getattr(model, 'matcher', None)
+    if matcher is not None:
+        radius = int(getattr(matcher, 'radius', radius))
+    # H/4 search radius → full-res cells; + encoder RF margin
+    return int(radius * 4 + 16)
+
+
 @torch.no_grad()
 def infer_tiled(model, low, ref=None, tile=256, overlap=32):
     """Tile restore; stitch with cosine feather. Ref tiles match Low tiles.
 
     Query alignment gamma/LUT estimated once on the full image and reused
     for every tile (stats_scope=full_image).
+
+    For ASRTv4, each tile is expanded by a matching halo so local soft
+    correspondence sees valid neighbors; only the core tile is blended.
     """
     model.eval()
     use_g = bool(getattr(model.backbone, 'use_global_illum', False))
@@ -48,6 +63,7 @@ def infer_tiled(model, low, ref=None, tile=256, overlap=32):
         model.backbone.use_global_illum = False
 
     qg, ql = _full_image_query_maps(model, low, ref)
+    halo = _v4_match_halo(model)
 
     _, _, H, W = low.shape
     if H <= tile and W <= tile:
@@ -75,11 +91,19 @@ def infer_tiled(model, low, ref=None, tile=256, overlap=32):
         for x0 in range(0, max(1, W - overlap), stride):
             y0 = min(y0, H - tile)
             x0 = min(x0, W - tile)
-            low_t = low[:, :, y0:y0 + tile, x0:x0 + tile]
-            ref_t = None if ref is None else ref[:, :, y0:y0 + tile, x0:x0 + tile]
+            y1, x1 = y0 + tile, x0 + tile
+            ys = max(0, y0 - halo)
+            xs = max(0, x0 - halo)
+            ye = min(H, y1 + halo)
+            xe = min(W, x1 + halo)
+            low_t = low[:, :, ys:ye, xs:xe]
+            ref_t = None if ref is None else ref[:, :, ys:ye, xs:xe]
             pred = model(low_t, ref=ref_t, query_gamma=qg, query_lut=ql)
-            acc[:, :, y0:y0 + tile, x0:x0 + tile] += pred * feather
-            wt[:, :, y0:y0 + tile, x0:x0 + tile] += feather
+            # Crop halo back to core tile
+            cy0, cx0 = y0 - ys, x0 - xs
+            pred_core = pred[:, :, cy0:cy0 + tile, cx0:cx0 + tile]
+            acc[:, :, y0:y1, x0:x1] += pred_core * feather
+            wt[:, :, y0:y1, x0:x1] += feather
             if x0 + tile >= W:
                 break
         if y0 + tile >= H:
