@@ -13,7 +13,7 @@ class TestCheckpointResume(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             cfg = dict(
                 stage='a', out_dir=td, max_steps=2, total_steps=2,
-                batch_size=1, lr=1e-4, amp=False, grad_clip=1.0,
+                batch_size=1, accum=2, lr=1e-4, amp=False, grad_clip=1.0,
                 crop=32, log_every=1, eval_every=100, save_every=100,
                 workers=0, seed=0, no_ref_prob=1.0,
                 model=dict(num_res_blocks='2+2+1+1', n_feats=32, freeze_lte=True),

@@ -3,7 +3,8 @@ out_dir: /root/data/experiments/ASRT/stage_b
 seed: 42
 max_steps: 100000
 total_steps: 100000
-batch_size: 1
+batch_size: 8
+accum: 1
 lr: 1.0e-5
 lr_backbone: 1.0e-5
 lr_inject: 1.0e-4

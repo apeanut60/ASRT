@@ -36,7 +36,10 @@ def main():
     cfg = {}
     if a.config:
         cfg = yaml.safe_load(open(a.config))
-    model = build_asrt(cfg.get('model', {})).to(device)
+    model_cfg = dict(cfg.get('model', {}) or {})
+    if cfg.get('query_alignment') is not None:
+        model_cfg['query_align'] = dict(cfg['query_alignment'])
+    model = build_asrt(model_cfg).to(device)
     ck = torch.load(a.ckpt, map_location=device)
     state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
     model.load_state_dict(state, strict=False)

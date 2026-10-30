@@ -12,7 +12,7 @@ class TestNativeTlv(unittest.TestCase):
         m = ASRT(num_res_blocks='2+2+1+1', n_feats=32, freeze_lte=True)
         low = torch.randn(1, 3, 64, 64)
         ref = torch.randn(1, 3, 64, 64)
-        S, T3, T2, T1, _ = m.match_reference(low, ref)
+        S, T3, T2, T1, _, _diag = m.match_reference(low, ref)
         # After pad to 64: LTE lv3 is H/4=16, lv2=H/2=32, lv1=H=64
         self.assertEqual(tuple(S.shape[-2:]), (16, 16))
         self.assertEqual(tuple(T3.shape[-2:]), (16, 16))

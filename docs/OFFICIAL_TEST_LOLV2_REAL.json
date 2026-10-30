@@ -1,0 +1,23 @@
+{
+  "dataset": "LOLv2-Real official Test n=100",
+  "protocol": "RGB PSNR/SSIM [0,1], crop_border=0, no GT mean-align",
+  "stage_a_best_bypass": {
+    "psnr_rgb": 20.22166271743764,
+    "ssim_rgb": 0.8256439091071307,
+    "n": 100
+  },
+  "stage_b_best_bypass": {
+    "psnr_rgb": 19.893568475425337,
+    "ssim_rgb": 0.8186802129118831,
+    "n": 100
+  },
+  "stage_b_best_correct": {
+    "psnr_rgb": 20.499792875033307,
+    "ssim_rgb": 0.8213529309302818,
+    "n": 100
+  },
+  "ckpts": {
+    "a": "/root/data/experiments/ASRT/stage_a/checkpoints/best.pt",
+    "b": "/root/data/experiments/ASRT/stage_b/checkpoints/best.pt"
+  }
+}

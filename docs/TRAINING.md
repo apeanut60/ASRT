@@ -25,6 +25,7 @@
 ## Trainer features
 
 - AMP + GradScaler (CUDA), grad clip start `1.0` with clip-event logging.
+- Gradient accumulation: `accum` micro-batches per optimizer step (`loss` scaled by `1/accum`). Stage A default: `batch_size=8`, `accum=1`. `max_steps` counts optimizer steps.
 - Checkpoints: model / optim / sched / scaler / RNG / cfg / step.
 - Resume: `python scripts/train.py --config ... --resume path/to/last.pt`.
 

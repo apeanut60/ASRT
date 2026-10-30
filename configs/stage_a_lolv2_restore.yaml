@@ -3,9 +3,9 @@ out_dir: /root/data/experiments/ASRT/stage_a
 seed: 42
 max_steps: 80000
 total_steps: 80000
-batch_size: 1
-# effective batch 8 via grad accumulation if needed; smoke uses batch 1
-accum: 8
+batch_size: 8
+# real batch 8; accum kept at 1 (no need to fake large batch on 4090)
+accum: 1
 lr: 2.0e-4
 eta_min: 1.0e-6
 betas: [0.9, 0.999]

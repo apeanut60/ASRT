@@ -9,7 +9,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from asrt.models.attention import IGAB, IlluminationEstimator
+from asrt.models.cond_resblock import CondResBlock
+from asrt.models.illumination_prior import IlluminationAdapter
 from asrt.models.legacy_heads import GlobalIllumHead, RefIllumTransfer
+from asrt.models.reliability import FineCTRefine
 
 
 def conv1x1(in_ch, out_ch, stride=1):
@@ -140,6 +143,7 @@ class CSFIUNet(nn.Module):
         use_global_illum=False,
         use_ref_illum=False,
         ref_illum_pool=8,
+        enable_v3: bool = False,
     ):
         super().__init__()
         blocks = parse_num_res_blocks(num_res_blocks)
@@ -150,6 +154,7 @@ class CSFIUNet(nn.Module):
         self.enable_lightup = enable_lightup
         self.use_global_illum = bool(use_global_illum)
         self.use_ref_illum = bool(use_ref_illum)
+        self.enable_v3 = bool(enable_v3)
 
         self.SFE = SFE(blocks[0], n_feats, res_scale)
         self.down1 = nn.Sequential(conv3x3(n_feats, n_feats, stride=2), nn.LeakyReLU(0.1))
@@ -190,8 +195,20 @@ class CSFIUNet(nn.Module):
         self.global_illum_head = GlobalIllumHead()
         self.ref_illum = RefIllumTransfer(pool=ref_illum_pool)
 
+        # ASRT-v3 modules (optional). Last Coarse/Middle RB → CondResBlock.
+        self.coarse_illum_adapter = None
+        self.middle_illum_adapter = None
+        self.fine_ct_refine = None
+        if self.enable_v3:
+            self.RB11[-1] = CondResBlock(n_feats, res_scale)
+            self.RB22[-1] = CondResBlock(n_feats, res_scale)
+            self.coarse_illum_adapter = IlluminationAdapter(n_feats)
+            self.middle_illum_adapter = IlluminationAdapter(n_feats)
+            self.fine_ct_refine = FineCTRefine()
+
         self.last_gate = None
         self.last_used_reference = False
+        self.last_v3_diag = None
 
     @staticmethod
     def safe_pad(x, target_hw):
@@ -220,18 +237,24 @@ class CSFIUNet(nn.Module):
         return torch.sigmoid(F.interpolate(
             S, size=feat.shape[-2:], mode='bicubic', align_corners=False))
 
-    def _inject(self, feat, T, S, head, use_ref: bool):
+    def _inject(self, feat, T, S, head, use_ref: bool, c_t=None):
         if not use_ref or T is None or S is None:
-            return feat
+            return feat, None
         T = self._align_ref(T, feat, 'T')
         g = self._gate(S, feat)
-        return feat + g * head(torch.cat([feat, T], dim=1))
+        residual = g * head(torch.cat([feat, T], dim=1))
+        if c_t is not None:
+            ct = resize_like(c_t, feat)
+            residual = ct * residual
+        return feat + residual, residual
 
-    @staticmethod
-    def _run_rbs(feat, rbs, tail):
+    def _run_rbs(self, feat, rbs, tail, l_guided=None, c_l=None):
         start = feat
         for rb in rbs:
-            feat = rb(feat)
+            if isinstance(rb, CondResBlock):
+                feat = rb(feat, l_guided, c_l)
+            else:
+                feat = rb(feat)
         return start + tail(feat)
 
     def forward(
@@ -243,18 +266,26 @@ class CSFIUNet(nn.Module):
         T_lv1=None,
         ref=None,
         use_reference: Optional[bool] = None,
+        c_t=None,
+        c_l=None,
+        illum_prior=None,
     ):
         """
         Args:
             x: Low RGB in [-1, 1]
             S/T_*: SearchTransfer outputs; ignored when use_reference is False
             use_reference: if None, inferred as (S is not None and all T present)
+            c_t / c_l: reliability maps [B,1,H/4,W/4] (v3)
+            illum_prior: dict with p_ref_matched / p_base / d_ref at H/4 (v3)
         """
         if use_reference is None:
             use_reference = (
                 S is not None and T_lv3 is not None
                 and T_lv2 is not None and T_lv1 is not None)
         self.last_used_reference = bool(use_reference)
+        use_v3 = bool(
+            self.enable_v3 and use_reference and c_t is not None and c_l is not None
+            and illum_prior is not None)
 
         orig_hw = x.shape[-2:]
         th = int(math.ceil(orig_hw[0] / 4.0) * 4)
@@ -275,21 +306,54 @@ class CSFIUNet(nn.Module):
         illu_h2 = resize_like(illu_h, e1)
         illu_h4 = resize_like(illu_h, e2)
 
-        x11 = self._inject(e2, T_lv3, S, self.conv11_head, use_reference)
-        x11 = self._run_rbs(x11, self.RB11, self.conv11_tail)
-        x11 = self.coarse_igab(x11, illu_h4)
+        # Guided illumination (v3): L_guided = L_low + C_L * DeltaL_ref
+        l_guided_h4 = illu_h4
+        l_guided_h2 = illu_h2
+        delta_c = delta_m = None
+        if use_v3:
+            l_guided_h4, delta_c = self.coarse_illum_adapter(
+                illu_h4,
+                illum_prior['p_ref_matched'],
+                illum_prior['p_base'],
+                illum_prior['d_ref'],
+                c_l,
+            )
+            l_guided_h2, delta_m = self.middle_illum_adapter(
+                illu_h2,
+                illum_prior['p_ref_matched'],
+                illum_prior['p_base'],
+                illum_prior['d_ref'],
+                c_l,
+            )
+
+        c_t_h4 = c_t if use_v3 else None
+        c_t_h2 = resize_like(c_t, e1) if use_v3 else None
+        c_t_h1 = None
+        if use_v3:
+            c_t_up = resize_like(c_t, e0)
+            c_t_h1 = self.fine_ct_refine(c_t_up, low)
+
+        x11, res11 = self._inject(e2, T_lv3, S, self.conv11_head, use_reference, c_t_h4)
+        x11 = self._run_rbs(
+            x11, self.RB11, self.conv11_tail,
+            l_guided=l_guided_h4 if use_v3 else None,
+            c_l=c_l if use_v3 else None)
+        x11 = self.coarse_igab(x11, l_guided_h4)
 
         x21 = x11
         x22 = self.skip_e1(torch.cat([resize_like(x11, e1), e1], dim=1))
-        x22 = self._inject(x22, T_lv2, S, self.conv22_head, use_reference)
+        x22, res22 = self._inject(x22, T_lv2, S, self.conv22_head, use_reference, c_t_h2)
         x21, x22 = self.ex12(x21, x22)
         x21 = self._run_rbs(x21, self.RB21, self.conv21_tail)
-        x22 = self._run_rbs(x22, self.RB22, self.conv22_tail)
-        x22 = self.middle_igab(x22, illu_h2)
+        x22 = self._run_rbs(
+            x22, self.RB22, self.conv22_tail,
+            l_guided=l_guided_h2 if use_v3 else None,
+            c_l=c_l if use_v3 else None)
+        x22 = self.middle_igab(x22, l_guided_h2)
 
         x31, x32 = x21, x22
         x33 = self.skip_e0(torch.cat([resize_like(x22, e0), e0], dim=1))
-        x33 = self._inject(x33, T_lv1, S, self.conv33_head, use_reference)
+        x33, res33 = self._inject(x33, T_lv1, S, self.conv33_head, use_reference, c_t_h1)
         x31, x32, x33 = self.ex123(x31, x32, x33)
         x31 = self._run_rbs(x31, self.RB31, self.conv31_tail)
         x32 = self._run_rbs(x32, self.RB32, self.conv32_tail)
@@ -305,4 +369,20 @@ class CSFIUNet(nn.Module):
 
         g = self._gate(S, e0)
         self.last_gate = None if g is None else g.detach()
+        if use_v3:
+            self.last_v3_diag = dict(
+                c_t=c_t.detach(),
+                c_l=c_l.detach(),
+                c_t_fine=None if c_t_h1 is None else c_t_h1.detach(),
+                delta_l_coarse=None if delta_c is None else delta_c.detach(),
+                delta_l_middle=None if delta_m is None else delta_m.detach(),
+                inject_res_norm=dict(
+                    coarse=float(res11.detach().norm()) if res11 is not None else 0.0,
+                    middle=float(res22.detach().norm()) if res22 is not None else 0.0,
+                    fine=float(res33.detach().norm()) if res33 is not None else 0.0,
+                ),
+                base=base.detach(),
+            )
+        else:
+            self.last_v3_diag = None
         return out

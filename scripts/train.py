@@ -46,7 +46,11 @@ def resolve_rows(cfg):
     if stage in ('b', 'stage_b'):
         ref = load('lolv2_real_triplet_train.json') + load('lolv2_syn_triplet_train.json')
         noref = load('lolv2_real_paired_train.json') + load('lolv2_syn_paired_train.json')
-        eval_rows = load('lolv2_real_triplet_dev.json')
+        # Prefer ref-capable unified Dev; fallback to paired_dev name if present.
+        try:
+            eval_rows = load('lolv2_real_triplet_dev.json')
+        except SystemExit:
+            eval_rows = load('lolv2_real_paired_dev.json')
         return dict(train_rows_ref=ref, train_rows_noref=noref, eval_rows=eval_rows)
 
     # Stage C

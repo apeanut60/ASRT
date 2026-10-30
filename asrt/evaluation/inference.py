@@ -6,25 +6,52 @@ import math
 import torch
 import torch.nn.functional as F
 
+from asrt.models.query_illum_align import estimate_query_align_maps
+
+
+def _full_image_query_maps(model, low, ref):
+    """Estimate gamma/LUT once on full Low/Ref for tiled reuse."""
+    cfg = getattr(model, 'query_align_cfg', {}) or {}
+    if ref is None or not cfg.get('enabled', False):
+        return None, None
+    method = str(cfg.get('method', 'gamma_hist')).lower()
+    if method in ('none', 'off', 'raw'):
+        return None, None
+    alpha = float(cfg.get('gamma_alpha', 0.75))
+    gamma, lut, _ = estimate_query_align_maps(
+        low, ref,
+        alpha=alpha,
+        gamma_min=float(cfg.get('gamma_min', 0.3)),
+        gamma_max=float(cfg.get('gamma_max', 1.0)),
+        bins=int(cfg.get('hist_bins', 256)),
+    )
+    return gamma, lut
+
 
 @torch.no_grad()
 def infer_full(model, low, ref=None):
     model.eval()
+    # Full-image path: model estimates align internally if overrides are None.
     return model(low, ref=ref, return_aux=False)
 
 
 @torch.no_grad()
 def infer_tiled(model, low, ref=None, tile=256, overlap=32):
-    """Tile restore; stitch with cosine feather. Ref tiles match Low tiles."""
+    """Tile restore; stitch with cosine feather. Ref tiles match Low tiles.
+
+    Query alignment gamma/LUT estimated once on the full image and reused
+    for every tile (stats_scope=full_image).
+    """
     model.eval()
-    # Temporarily disable global illum during tiles; apply once at end if needed.
     use_g = bool(getattr(model.backbone, 'use_global_illum', False))
     if use_g:
         model.backbone.use_global_illum = False
 
+    qg, ql = _full_image_query_maps(model, low, ref)
+
     _, _, H, W = low.shape
     if H <= tile and W <= tile:
-        out = model(low, ref=ref)
+        out = model(low, ref=ref, query_gamma=qg, query_lut=ql)
         if use_g:
             model.backbone.use_global_illum = True
             out = model.backbone.global_illum_head.apply(out, low)
@@ -50,7 +77,7 @@ def infer_tiled(model, low, ref=None, tile=256, overlap=32):
             x0 = min(x0, W - tile)
             low_t = low[:, :, y0:y0 + tile, x0:x0 + tile]
             ref_t = None if ref is None else ref[:, :, y0:y0 + tile, x0:x0 + tile]
-            pred = model(low_t, ref=ref_t)
+            pred = model(low_t, ref=ref_t, query_gamma=qg, query_lut=ql)
             acc[:, :, y0:y0 + tile, x0:x0 + tile] += pred * feather
             wt[:, :, y0:y0 + tile, x0:x0 + tile] += feather
             if x0 + tile >= W:

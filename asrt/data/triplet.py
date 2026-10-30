@@ -8,18 +8,27 @@ import torch
 from torch.utils.data import Dataset
 
 from asrt.data.paired import read_rgb_m11, sync_geometry
+from asrt.models.query_illum_align import estimate_query_align_maps
 
 
 class TripletRefDataset(Dataset):
-    def __init__(self, rows: List[dict], crop: int = 256, seed: int = 42,
-                 augment: bool = True, epoch: int = 0,
-                 allow_missing_ref: bool = False):
+    def __init__(
+        self,
+        rows: List[dict],
+        crop: int = 256,
+        seed: int = 42,
+        augment: bool = True,
+        epoch: int = 0,
+        allow_missing_ref: bool = False,
+        query_align: Optional[dict] = None,
+    ):
         self.rows = list(rows)
         self.crop = int(crop)
         self.seed = int(seed)
         self.augment = bool(augment)
         self.epoch = int(epoch)
         self.allow_missing_ref = bool(allow_missing_ref)
+        self.query_align = dict(query_align or {})
         if not allow_missing_ref:
             bad = [r['sample_id'] for r in self.rows if not r.get('ref_path')]
             if bad:
@@ -32,6 +41,27 @@ class TripletRefDataset(Dataset):
 
     def __len__(self):
         return len(self.rows)
+
+    def _estimate_full_align(self, low, ref):
+        """Estimate gamma/LUT on full-resolution tensors before crop."""
+        cfg = self.query_align
+        if not cfg.get('enabled', False):
+            return None, None
+        alpha = float(cfg.get('gamma_alpha', 0.75))
+        method = str(cfg.get('method', 'gamma_hist')).lower()
+        if method in ('none', 'off', 'raw'):
+            return None, None
+        if method == 'gamma':
+            # still estimate lut for API uniformity but beta=0 later
+            pass
+        gamma, lut, _ = estimate_query_align_maps(
+            low[None], ref[None],
+            alpha=alpha,
+            gamma_min=float(cfg.get('gamma_min', 0.3)),
+            gamma_max=float(cfg.get('gamma_max', 1.0)),
+            bins=int(cfg.get('hist_bins', 256)),
+        )
+        return gamma[0].detach().cpu(), lut[0].detach().cpu()
 
     def __getitem__(self, idx):
         row = self.rows[idx]
@@ -53,6 +83,12 @@ class TripletRefDataset(Dataset):
         if ref is not None and tuple(ref.shape[-2:]) != hw:
             ref = torch.nn.functional.interpolate(
                 ref[None], size=hw, mode='bilinear', align_corners=False)[0]
+
+        # Full-image alignment stats BEFORE geometry crop (stats_scope=full_image).
+        query_gamma, query_lut = (None, None)
+        if ref is not None:
+            query_gamma, query_lut = self._estimate_full_align(low, ref)
+
         rng = np.random.RandomState(self.seed + self.epoch * 1000003 + idx)
         if self.augment and self.crop > 0:
             if ref is None:
@@ -62,7 +98,10 @@ class TripletRefDataset(Dataset):
         return dict(
             low=low, gt=gt, ref=ref,
             sample_id=row['sample_id'], has_ref=has_ref,
-            domain=row.get('domain', ''))
+            domain=row.get('domain', ''),
+            query_gamma=query_gamma,
+            query_lut=query_lut,
+        )
 
 
 def collate_skip_none_ref(batch):
@@ -75,9 +114,15 @@ def collate_skip_none_ref(batch):
             if all(v is None for v in vals):
                 out[k] = None
             elif any(v is None for v in vals):
-                # Mixed ref/no-ref in one batch is unsupported for SearchTransfer.
                 raise RuntimeError(
                     'mixed has_ref in one batch; sample no-ref separately')
+            else:
+                out[k] = torch.stack(vals, 0)
+        elif k in ('query_gamma', 'query_lut'):
+            if all(v is None for v in vals):
+                out[k] = None
+            elif any(v is None for v in vals):
+                raise RuntimeError('mixed query_align tensors in one batch')
             else:
                 out[k] = torch.stack(vals, 0)
         elif isinstance(vals[0], torch.Tensor):

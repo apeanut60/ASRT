@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from asrt.data.paired import PairedRestoreDataset
 from asrt.data.triplet import TripletRefDataset, collate_skip_none_ref
 from asrt.evaluation.metrics import psnr_ssim_rgb
-from asrt.models.asrt import ASRT, build_asrt
+from asrt.models.asrt import ASRT, build_asrt, load_b_v2_into_v3
 from asrt.training.optimizer import build_optimizer
 from asrt.training.scheduler import build_scheduler
 
@@ -28,7 +28,11 @@ class Trainer:
     def __init__(self, cfg: dict, device: Optional[str] = None):
         self.cfg = dict(cfg)
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = build_asrt(cfg.get('model', {})).to(self.device)
+        model_cfg = dict(cfg.get('model', {}) or {})
+        # Top-level query_alignment merges into model.query_align
+        if cfg.get('query_alignment') is not None:
+            model_cfg['query_align'] = dict(cfg['query_alignment'])
+        self.model = build_asrt(model_cfg).to(self.device)
         self.opt = build_optimizer(self.model, cfg)
         self.sched = build_scheduler(self.opt, cfg)
         self.scaler = GradScaler(enabled=bool(cfg.get('amp', True)) and self.device == 'cuda')
@@ -40,14 +44,45 @@ class Trainer:
         self.log_f = None
         self.best = None
         self.no_ref_prob = float(cfg.get('no_ref_prob', 0.0))
+        self.teacher_w = float(cfg.get('teacher_consistency_weight', 0.0))
+        self.stable_steps = int(cfg.get('stable_steps', 0))
+        self._base_lrs = [float(g['lr']) for g in self.opt.param_groups]
+        self.teacher = None
+        t_ckpt = cfg.get('teacher_ckpt') or ''
+        if self.teacher_w > 0 and t_ckpt and os.path.isfile(t_ckpt):
+            # Frozen Stage-A teacher (no v3); eval mode forever
+            t_cfg = dict(model_cfg)
+            t_cfg['enable_v3'] = False
+            self.teacher = build_asrt(t_cfg).to(self.device)
+            ck = torch.load(t_ckpt, map_location=self.device)
+            state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+            self.teacher.load_state_dict(state, strict=True)
+            self.teacher.eval()
+            for p in self.teacher.parameters():
+                p.requires_grad = False
+            print('teacher loaded from %s (w=%.3f)' % (t_ckpt, self.teacher_w), flush=True)
+
+    def _apply_stable_lrs(self):
+        """During stable_steps: keep v3_new LR, zero other group LRs."""
+        if self.stable_steps <= 0:
+            return
+        in_stable = self.step < self.stable_steps
+        if not in_stable:
+            return
+        for g, base in zip(self.opt.param_groups, self._base_lrs):
+            if g.get('name') == 'v3_new':
+                g['lr'] = base
+            else:
+                g['lr'] = 0.0
 
     def _loader(self, rows, crop, with_ref: bool, shuffle=True):
         bs = int(self.cfg.get('batch_size', 1))
         workers = int(self.cfg.get('workers', 2))
+        qa = self.cfg.get('query_alignment') or self.cfg.get('model', {}).get('query_align')
         if with_ref:
             ds = TripletRefDataset(
                 rows, crop=crop, seed=int(self.cfg.get('seed', 42)),
-                augment=True, allow_missing_ref=False)
+                augment=True, allow_missing_ref=False, query_align=qa)
         else:
             ds = PairedRestoreDataset(
                 rows, crop=crop, seed=int(self.cfg.get('seed', 42)), augment=True)
@@ -74,7 +109,15 @@ class Trainer:
 
     def load(self, path: str, resume_optim: bool = True):
         ck = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ck['model'])
+        state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
+        if (getattr(self.model, 'enable_v3', False)
+                and not resume_optim
+                and bool(self.cfg.get('pretrained_is_b_v2', True))):
+            info = load_b_v2_into_v3(self.model, state)
+            print('v3 warm-start from B-v2: loaded=%d missing_new=%d' % (
+                info['loaded'], len(info['missing'])), flush=True)
+        else:
+            self.model.load_state_dict(state, strict=True)
         if resume_optim:
             self.step = int(ck.get('step', 0))
             self.best = ck.get('best')
@@ -118,7 +161,7 @@ class Trainer:
             if use_tile:
                 pred = infer_tiled(self.model, low, ref, tile=tile, overlap=32)
             else:
-                pred = infer_full(self.model, low, ref)
+                pred = infer_full(self.model, low, ref)  # full-image align inside model
             scores.append(psnr_ssim_rgb(pred, gt))
             del low, gt, ref, pred
             if torch.cuda.is_available():
@@ -176,35 +219,64 @@ class Trainer:
 
         noref_keys = [k for k in loaders if k.startswith('noref')]
 
+        accum = max(1, int(self.cfg.get('accum', 1)))
+        micro_bs = int(self.cfg.get('batch_size', 1))
+        eff_batch = micro_bs * accum
+        print('train accum=%d batch=%d effective_batch=%d' % (
+            accum, micro_bs, eff_batch), flush=True)
+
         t0 = time.time()
         peak_mem = 0.0
         clipped = 0
         self.log_f = open(os.path.join(self.out_dir, 'train.jsonl'), 'a')
         self.model.train()
         while self.step < max_steps:
-            # Choose ref / no-ref
-            if 'ref' in loaders and noref_keys:
-                use_ref = (np.random.rand() >= self.no_ref_prob)
-            elif 'ref' in loaders:
-                use_ref = True
-            else:
-                use_ref = False
-            if use_ref:
-                batch = next_batch('ref')
-            else:
-                kind = noref_keys[int(np.random.randint(0, len(noref_keys)))]
-                batch = next_batch(kind)
+            self.opt.zero_grad(set_to_none=True)
+            loss_avg = 0.0
+            use_ref = False
+            for _micro in range(accum):
+                # Choose ref / no-ref per micro-batch
+                if 'ref' in loaders and noref_keys:
+                    use_ref = (np.random.rand() >= self.no_ref_prob)
+                elif 'ref' in loaders:
+                    use_ref = True
+                else:
+                    use_ref = False
+                if use_ref:
+                    batch = next_batch('ref')
+                else:
+                    kind = noref_keys[int(np.random.randint(0, len(noref_keys)))]
+                    batch = next_batch(kind)
             low = batch['low'].to(self.device)
             gt = batch['gt'].to(self.device)
             ref = None if (not use_ref or batch.get('ref') is None) else batch['ref'].to(self.device)
+            qg = batch.get('query_gamma')
+            ql = batch.get('query_lut')
+            if qg is not None:
+                qg = qg.to(self.device)
+            if ql is not None:
+                ql = ql.to(self.device)
 
-            self.opt.zero_grad(set_to_none=True)
+            # Stable period: only train new v3 modules initially
+            self._apply_stable_lrs()
+
+            teacher_l = 0.0
             with autocast(enabled=self.scaler.is_enabled()):
-                pred = self.model(low, ref=ref)
+                pred = self.model(low, ref=ref, query_gamma=qg, query_lut=ql)
                 loss = l1_loss(pred, gt)
-            if not torch.isfinite(loss):
-                raise SystemExit('non-finite loss at step %d' % self.step)
-            self.scaler.scale(loss).backward()
+                if (self.teacher is not None and self.teacher_w > 0
+                        and (not use_ref or ref is None)):
+                    with torch.no_grad():
+                        t_pred = self.teacher(low, ref=None)
+                    t_loss = l1_loss(pred, t_pred)
+                    loss = loss + self.teacher_w * t_loss
+                    teacher_l = float(t_loss.detach())
+                loss = loss / float(accum)
+                if not torch.isfinite(loss):
+                    raise SystemExit('non-finite loss at step %d' % self.step)
+                self.scaler.scale(loss).backward()
+                loss_avg += float(loss.detach()) * accum
+
             self.scaler.unscale_(self.opt)
             if self.clip > 0:
                 gnorm = torch.nn.utils.clip_grad_norm_(
@@ -215,7 +287,9 @@ class Trainer:
                 gnorm = 0.0
             self.scaler.step(self.opt)
             self.scaler.update()
-            self.sched.step()
+            # Cosine schedule only after stable period for non-v3 groups
+            if self.step >= self.stable_steps:
+                self.sched.step()
             self.step += 1
 
             if torch.cuda.is_available():
@@ -223,15 +297,28 @@ class Trainer:
 
             if self.step % log_every == 0 or self.step == 1:
                 lr = self.opt.param_groups[0]['lr']
+                lr_map = {g.get('name', str(i)): float(g['lr'])
+                          for i, g in enumerate(self.opt.param_groups)}
                 row = dict(
-                    step=self.step, loss=float(loss.detach()), lr=lr,
-                    gnorm=float(gnorm), used_ref=bool(use_ref),
+                    step=self.step, loss=loss_avg / float(accum),
+                    lr=lr, lr_groups=lr_map, gnorm=float(gnorm),
+                    used_ref=bool(use_ref),
+                    teacher_l1=teacher_l,
+                    stable=bool(self.step <= self.stable_steps),
                     peak_mem_mb=peak_mem, clip_events=clipped,
+                    accum=accum, effective_batch=eff_batch,
                 )
+                aux = getattr(self.model, 'last_aux', None) or {}
+                if aux.get('c_t_stats'):
+                    row['c_t'] = aux['c_t_stats']
+                    row['c_l'] = aux['c_l_stats']
+                if aux.get('v3') and aux['v3'].get('inject_res_norm'):
+                    row['inject_res_norm'] = aux['v3']['inject_res_norm']
                 self.log_f.write(json.dumps(row) + '\n')
                 self.log_f.flush()
-                print('step %d/%d loss=%.4f lr=%.2e ref=%s mem=%.0fMB' % (
-                    self.step, max_steps, row['loss'], lr, use_ref, peak_mem), flush=True)
+                print('step %d/%d loss=%.4f lr=%.2e ref=%s accum=%d mem=%.0fMB' % (
+                    self.step, max_steps, row['loss'], lr, use_ref, accum, peak_mem),
+                    flush=True)
 
             if eval_rows and (self.step % eval_every == 0 or self.step == max_steps):
                 metrics = self.evaluate(
