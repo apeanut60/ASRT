@@ -258,6 +258,16 @@ class Trainer:
         t0 = time.time()
         peak_mem = 0.0
         clipped = 0
+        sample_stats = dict(
+            ref_batches=0, pure_noref_batches=0,
+            dual_noref_loss_sum=0.0, pure_noref_loss_sum=0.0,
+            dual_noref_n=0, pure_noref_n=0,
+            domain_real=0, domain_syn=0, domain_other=0,
+        )
+        print(
+            'sampling: no_ref_prob=%.3f dual_forward=%s lambda_no_ref=%.3f'
+            % (self.no_ref_prob, self.dual_forward, self.lambda_no_ref),
+            flush=True)
         self.log_f = open(os.path.join(self.out_dir, 'train.jsonl'), 'a')
         self.model.train()
         while self.step < max_steps:
@@ -287,12 +297,32 @@ class Trainer:
             if ql is not None:
                 ql = ql.to(self.device)
 
+            # Domain accounting (batch may carry per-sample domain via dataset rows)
+            domains = batch.get('domain')
+            if domains is None:
+                sample_stats['domain_other'] += 1
+            else:
+                if torch.is_tensor(domains):
+                    domains = [str(d) for d in domains]
+                elif isinstance(domains, str):
+                    domains = [domains]
+                for d in domains:
+                    dl = str(d).lower()
+                    if dl == 'real':
+                        sample_stats['domain_real'] += 1
+                    elif dl in ('syn', 'synthetic'):
+                        sample_stats['domain_syn'] += 1
+                    else:
+                        sample_stats['domain_other'] += 1
+
             # Stable period: only train new v3 modules initially
             self._apply_stable_lrs()
 
             teacher_l = 0.0
             loss_ref_v = 0.0
             loss_noref_v = 0.0
+            loss_pure_noref_v = 0.0
+            batch_kind = 'ref_dual' if (use_ref and ref is not None) else 'pure_noref'
             with autocast(enabled=self.scaler.is_enabled()):
                 if self.dual_forward and use_ref and ref is not None:
                     # ASRT-v4: same Low/GT with and without reference
@@ -307,10 +337,18 @@ class Trainer:
                     loss = loss_ref + self.lambda_no_ref * loss_noref
                     loss_ref_v = float(loss_ref.detach())
                     loss_noref_v = float(loss_noref.detach())
+                    sample_stats['ref_batches'] += 1
+                    sample_stats['dual_noref_loss_sum'] += loss_noref_v
+                    sample_stats['dual_noref_n'] += 1
                     pred = pred_ref
                 else:
                     pred = self.model(low, ref=ref, query_gamma=qg, query_lut=ql)
                     loss = l1_loss(pred, gt)
+                    loss_pure_noref_v = float(loss.detach())
+                    sample_stats['pure_noref_batches'] += 1
+                    sample_stats['pure_noref_loss_sum'] += loss_pure_noref_v
+                    sample_stats['pure_noref_n'] += 1
+                    batch_kind = 'pure_noref'
                     if (self.teacher is not None and self.teacher_w > 0
                             and (not use_ref or ref is None)):
                         with torch.no_grad():
@@ -350,10 +388,14 @@ class Trainer:
                     step=self.step, loss=loss_avg / float(accum),
                     lr=lr, lr_groups=lr_map, gnorm=float(gnorm),
                     used_ref=bool(use_ref),
+                    batch_kind=batch_kind,
                     teacher_l1=teacher_l,
                     loss_ref=loss_ref_v,
                     loss_noref=loss_noref_v,
+                    loss_pure_noref=loss_pure_noref_v,
                     lambda_no_ref=self.lambda_no_ref if self.dual_forward else 0.0,
+                    no_ref_prob=self.no_ref_prob,
+                    sample_stats=dict(sample_stats),
                     stable=bool(self.step <= self.stable_steps),
                     peak_mem_mb=peak_mem, clip_events=clipped,
                     accum=accum, effective_batch=eff_batch,
@@ -396,6 +438,7 @@ class Trainer:
             clip_events=clipped,
             best=self.best,
             cfg=self.cfg,
+            sample_stats=dict(sample_stats),
         )
         with open(os.path.join(self.out_dir, 'summary.json'), 'w') as f:
             json.dump(summary, f, indent=2)

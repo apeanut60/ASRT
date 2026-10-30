@@ -1,0 +1,64 @@
+# ASRT-v4 post-review fixed training (independent of stage_b_v4 @~800)
+stage: b_v4
+out_dir: /root/data/experiments/ASRT/stage_b_v4_fixed
+seed: 42
+max_steps: 100000
+total_steps: 100000
+batch_size: 4
+accum: 2
+lr: 1.0e-5
+lr_backbone: 1.0e-5
+lr_inject: 1.0e-5
+lr_igab: 2.0e-5
+lr_illum: 2.0e-5
+lr_v4: 1.0e-4
+eta_min: 1.0e-6
+amp: true
+grad_clip: 1.0
+crop: 256
+crop_syn: 128
+# Engineering initial mix (not tuned): dual-forward on ref + pure no-ref micro-batches
+no_ref_prob: 0.15
+dual_forward: true
+lambda_no_ref: 0.5
+teacher_consistency_weight: 0.0
+stable_steps: 0
+log_every: 50
+eval_every: 2000
+save_every: 2000
+eval_limit: 0
+workers: 2
+# Fresh warm-start from Stage A best @58k (do NOT resume broken stage_b_v4)
+pretrained: /root/data/experiments/ASRT/stage_a/checkpoints/best.pt
+pretrained_into_v4: true
+model:
+  version: v4
+  enable_v4: true
+  num_res_blocks: "8+8+4+2"
+  n_feats: 64
+  enable_lightup: true
+  match_dim: 64
+  match_radius: 4
+  match_temperature: 0.1
+  match_lambda_pos: 0.5
+  ref_base_ch: 32
+  reli_mid: 64
+  matching:
+    dim: 64
+    radius: 4
+    temperature: 0.1
+    lambda_pos: 0.5
+data:
+  manifest_root: /root/data/experiments/ASRT/manifests_b_v2
+  domain: all
+  real_low: /root/data/datasets/lol-v2-real/Train/Low
+  real_gt: /root/data/datasets/lol-v2-real/Train/Normal
+  real_ref: /root/data/datasets/lol-v2-real/Train/nanobanana_ref_v2
+  syn_low: /root/data/datasets/lol-v2-synthetic/Train/Low
+  syn_gt: /root/data/datasets/lol-v2-synthetic/Train/Normal
+  syn_ref: /root/data/datasets/lol-v2-synthetic/Train/nanobanana_ref
+  noref_real_low: /root/data/datasets/lol-v2-real/Train/Low
+  noref_real_gt: /root/data/datasets/lol-v2-real/Train/Normal
+  noref_syn_low: /root/data/datasets/lol-v2-synthetic/Train/Low
+  noref_syn_gt: /root/data/datasets/lol-v2-synthetic/Train/Normal
+  dev_frac: 0.05

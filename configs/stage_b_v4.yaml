@@ -16,8 +16,9 @@ amp: true
 grad_clip: 1.0
 crop: 256
 crop_syn: 128
-# Dual forward on every ref batch; optional pure no-ref mix kept low
-no_ref_prob: 0.0
+# Dual forward on ref batches + occasional pure no-ref micro-batches
+# (0.15 is an engineering initial mix, not a tuned optimum)
+no_ref_prob: 0.15
 dual_forward: true
 lambda_no_ref: 0.5
 # No frozen teacher for v4

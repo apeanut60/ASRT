@@ -47,15 +47,33 @@ def _v4_match_halo(model) -> int:
     return int(radius * 4 + 16)
 
 
+def _feather_2d(th, tw, y0, x0, H, W, overlap, device):
+    """Cosine feather only on *interior* tile overlaps; image borders stay 1."""
+    my = torch.ones(th, device=device)
+    mx = torch.ones(tw, device=device)
+    if overlap > 0:
+        n = min(overlap, th, tw)
+        ramp = 0.5 - 0.5 * torch.cos(
+            torch.linspace(0, math.pi, n, device=device))
+        if y0 > 0:
+            my[:n] = ramp
+        if y0 + th < H:
+            my[-n:] = ramp.flip(0)
+        if x0 > 0:
+            mx[:n] = ramp
+        if x0 + tw < W:
+            mx[-n:] = ramp.flip(0)
+    return (my[:, None] * mx[None, :]).view(1, 1, th, tw)
+
+
 @torch.no_grad()
-def infer_tiled(model, low, ref=None, tile=256, overlap=32):
+def infer_tiled(model, low, ref=None, tile=256, overlap=32, return_weight=False):
     """Tile restore; stitch with cosine feather. Ref tiles match Low tiles.
 
-    Query alignment gamma/LUT estimated once on the full image and reused
-    for every tile (stats_scope=full_image).
-
-    For ASRTv4, each tile is expanded by a matching halo so local soft
-    correspondence sees valid neighbors; only the core tile is blended.
+    - Image outer borders keep weight 1 (no zero-ramp at canvas edge).
+    - Only inter-tile overlaps are feathered.
+    - Supports H>tile & W<tile (and vice versa) via dynamic tile sizes.
+    - ASRTv4: each crop expands by matching halo; only core is blended.
     """
     model.eval()
     use_g = bool(getattr(model.backbone, 'use_global_illum', False))
@@ -71,27 +89,35 @@ def infer_tiled(model, low, ref=None, tile=256, overlap=32):
         if use_g:
             model.backbone.use_global_illum = True
             out = model.backbone.global_illum_head.apply(out, low)
+        if return_weight:
+            return out, torch.ones(1, 1, H, W, device=low.device)
         return out
 
-    stride = max(1, tile - overlap)
+    tile_h = min(int(tile), H)
+    tile_w = min(int(tile), W)
+    overlap_y = min(int(overlap), max(0, tile_h - 1))
+    overlap_x = min(int(overlap), max(0, tile_w - 1))
+    stride_y = max(1, tile_h - overlap_y)
+    stride_x = max(1, tile_w - overlap_x)
+
     acc = torch.zeros_like(low)
     wt = torch.zeros(1, 1, H, W, device=low.device)
-    my = torch.ones(tile, device=low.device)
-    mx = torch.ones(tile, device=low.device)
-    if overlap > 0:
-        ramp = 0.5 - 0.5 * torch.cos(
-            torch.linspace(0, math.pi, overlap, device=low.device))
-        my[:overlap] = ramp
-        my[-overlap:] = ramp.flip(0)
-        mx[:overlap] = ramp
-        mx[-overlap:] = ramp.flip(0)
-    feather = (my[:, None] * mx[None, :]).view(1, 1, tile, tile)
 
-    for y0 in range(0, max(1, H - overlap), stride):
-        for x0 in range(0, max(1, W - overlap), stride):
-            y0 = min(y0, H - tile)
-            x0 = min(x0, W - tile)
-            y1, x1 = y0 + tile, x0 + tile
+    y_starts = list(range(0, max(1, H - tile_h + 1), stride_y))
+    if y_starts[-1] != H - tile_h:
+        y_starts.append(H - tile_h)
+    x_starts = list(range(0, max(1, W - tile_w + 1), stride_x))
+    if x_starts[-1] != W - tile_w:
+        x_starts.append(W - tile_w)
+    # Deduplicate while preserving order
+    y_starts = list(dict.fromkeys(max(0, y) for y in y_starts))
+    x_starts = list(dict.fromkeys(max(0, x) for x in x_starts))
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            assert y0 >= 0 and x0 >= 0
+            y1, x1 = y0 + tile_h, x0 + tile_w
+            assert y1 <= H and x1 <= W
             ys = max(0, y0 - halo)
             xs = max(0, x0 - halo)
             ye = min(H, y1 + halo)
@@ -99,17 +125,25 @@ def infer_tiled(model, low, ref=None, tile=256, overlap=32):
             low_t = low[:, :, ys:ye, xs:xe]
             ref_t = None if ref is None else ref[:, :, ys:ye, xs:xe]
             pred = model(low_t, ref=ref_t, query_gamma=qg, query_lut=ql)
-            # Crop halo back to core tile
             cy0, cx0 = y0 - ys, x0 - xs
-            pred_core = pred[:, :, cy0:cy0 + tile, cx0:cx0 + tile]
+            pred_core = pred[:, :, cy0:cy0 + tile_h, cx0:cx0 + tile_w]
+            if pred_core.shape[-2:] != (tile_h, tile_w):
+                raise RuntimeError(
+                    'tile core shape %s != (%d,%d)' % (pred_core.shape[-2:], tile_h, tile_w))
+            feather = _feather_2d(
+                tile_h, tile_w, y0, x0, H, W,
+                max(overlap_y, overlap_x), low.device)
             acc[:, :, y0:y1, x0:x1] += pred_core * feather
             wt[:, :, y0:y1, x0:x1] += feather
-            if x0 + tile >= W:
-                break
-        if y0 + tile >= H:
-            break
-    out = acc / wt.clamp(min=1e-8)
+
+    if bool((wt <= 0).any()):
+        raise RuntimeError(
+            'tiled inference left uncovered pixels: zero_weight=%d / %d'
+            % (int((wt <= 0).sum()), int(wt.numel())))
+    out = acc / wt
     if use_g:
         model.backbone.use_global_illum = True
         out = model.backbone.global_illum_head.apply(out, low)
+    if return_weight:
+        return out, wt
     return out

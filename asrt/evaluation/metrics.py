@@ -8,13 +8,24 @@ import numpy as np
 import torch
 
 
-def to_uint8_rgb(t: torch.Tensor) -> np.ndarray:
-    """t: [-1,1] or [0,1] tensor [B,3,H,W] or [3,H,W] -> uint8 HWC."""
+def to_uint8_rgb(t: torch.Tensor, input_range: str = 'minus_one_one') -> np.ndarray:
+    """Convert tensor to uint8 HWC.
+
+    Args:
+        t: [B,3,H,W] or [3,H,W]
+        input_range: 'minus_one_one' (default, ASRT protocol) or 'zero_one'
+            Must be specified explicitly — no auto-guess from tensor min.
+    """
     if t.dim() == 4:
         t = t[0]
     x = t.detach().float().cpu()
-    if float(x.min()) < -0.05:
+    if input_range == 'minus_one_one':
         x = (x + 1.0) * 0.5
+    elif input_range == 'zero_one':
+        x = x
+    else:
+        raise ValueError(
+            "input_range must be 'minus_one_one' or 'zero_one', got %r" % (input_range,))
     x = x.clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).numpy()
     return x
 
@@ -51,9 +62,14 @@ def ssim_rgb(pred_u8: np.ndarray, gt_u8: np.ndarray) -> float:
         _ssim_map(pred_u8[:, :, i], gt_u8[:, :, i]) for i in range(3)]))
 
 
-def psnr_ssim_rgb(pred: torch.Tensor, gt: torch.Tensor) -> dict:
-    p = to_uint8_rgb(pred)
-    g = to_uint8_rgb(gt)
+def psnr_ssim_rgb(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    input_range: str = 'minus_one_one',
+) -> dict:
+    """Formal ASRT eval: tensors in [-1,1] by default (explicit input_range)."""
+    p = to_uint8_rgb(pred, input_range=input_range)
+    g = to_uint8_rgb(gt, input_range=input_range)
     if p.shape != g.shape:
         raise ValueError('shape mismatch %s vs %s' % (p.shape, g.shape))
     return dict(psnr_rgb=psnr_rgb(p, g), ssim_rgb=ssim_rgb(p, g))

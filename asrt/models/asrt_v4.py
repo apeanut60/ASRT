@@ -91,7 +91,18 @@ class ASRTv4(nn.Module):
         else:
             self.low_q_proj = nn.Identity()
             self.illum_q_proj = nn.Identity()
+        # Legacy VGG inject heads are unused in v4 forward; keep for Stage-A
+        # weight compatibility but freeze so they are not trained / counted active.
+        self._freeze_unused_inject_heads()
         self.last_aux = None
+
+    def _freeze_unused_inject_heads(self) -> None:
+        for name in ('conv11_head', 'conv22_head', 'conv33_head'):
+            mod = getattr(self.backbone, name, None)
+            if mod is None:
+                continue
+            for p in mod.parameters():
+                p.requires_grad = False
 
     @staticmethod
     def _resize_to(ref, hw):
@@ -106,10 +117,12 @@ class ASRTv4(nn.Module):
         weight: torch.Tensor,
         disp: torch.Tensor,
     ) -> dict:
-        """Soft-aggregate P_ref at H/4; warp to H/2 via expected displacement."""
-        p_ref = self.lpf(ref_m11)  # full-res LPF luminance [0,1]
-        p_base = self.lpf(base_m11)
-        # Down to H/4 of padded low (= weight spatial)
+        """Soft-aggregate P_ref at H/4 from [0,1] luminance proxies."""
+        # Explicit [-1,1] → [0,1] before LPF (P0 numerical-domain fix)
+        ref01 = ((ref_m11 + 1.0) * 0.5).clamp(0.0, 1.0)
+        base01 = ((base_m11 + 1.0) * 0.5).clamp(0.0, 1.0)
+        p_ref = self.lpf(ref01)
+        p_base = self.lpf(base01)
         h4, w4 = weight.shape[-2:]
         p_ref_h4 = F.interpolate(p_ref, size=(h4, w4), mode='bilinear', align_corners=True)
         p_base_h4 = F.interpolate(p_base, size=(h4, w4), mode='bilinear', align_corners=True)
@@ -127,7 +140,10 @@ class ASRTv4(nn.Module):
     def match_reference(self, stem: dict, ref: torch.Tensor):
         """Trainable local soft matching → multiscale T + reliability + illum prior."""
         low_pad = stem['low']
-        ref = self._resize_to(ref, low_pad.shape[-2:])
+        orig_hw = stem['orig_hw']
+        # Resize to *original* Low spatial size, then apply the same pad as Low.
+        # Do not treat pad pixels as a resize target (geometry consistency).
+        ref = self._resize_to(ref, orig_hw)
         ref = CSFIUNet.safe_pad(ref, low_pad.shape[-2:])
 
         f1, f2, f3 = self.ref_encoder(ref)
@@ -198,6 +214,9 @@ class ASRTv4(nn.Module):
                 continuity=float(md['continuity'].detach().mean()),
                 q_norm=float(md['q_norm'].detach().mean()),
                 k_norm=float(md['k_norm'].detach().mean()),
+                q_norm_pre=float(md['q_norm_pre'].detach().mean()),
+                k_norm_pre=float(md['k_norm_pre'].detach().mean()),
+                n_valid_mean=float(md['n_valid'].detach().mean()),
             )
             # keep tensors for viz (detached)
             aux['maps'] = dict(

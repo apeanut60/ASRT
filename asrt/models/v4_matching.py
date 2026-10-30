@@ -55,10 +55,12 @@ class LocalSoftMatcher(nn.Module):
         ksz = self.window
         r = self.radius
 
-        q = self.query_proj(torch.cat([low_feat_h4, illum_h4], dim=1))
-        k = self.key_proj(ref_feat_h4)
-        q = F.normalize(q, dim=1, eps=1e-6)
-        k = F.normalize(k, dim=1, eps=1e-6)
+        q_raw = self.query_proj(torch.cat([low_feat_h4, illum_h4], dim=1))
+        k_raw = self.key_proj(ref_feat_h4)
+        q_norm_pre = q_raw.norm(dim=1, keepdim=True)
+        k_norm_pre = k_raw.norm(dim=1, keepdim=True)
+        q = F.normalize(q_raw, dim=1, eps=1e-6)
+        k = F.normalize(k_raw, dim=1, eps=1e-6)
 
         # Local key windows: [B, C*K, H, W] → [B, C, K, H, W]
         k_unf = F.unfold(k, kernel_size=ksz, padding=r)  # [B, C*K, HW]
@@ -97,24 +99,46 @@ class LocalSoftMatcher(nn.Module):
         dy = (weight * yy.reshape(1, -1, 1)).sum(dim=1).view(b, 1, h, w)
         disp = torch.cat([dx, dy], dim=1)
 
-        # Diagnostics for reliability
-        entropy = -(weight.clamp_min(1e-8) * weight.clamp_min(1e-8).log()).sum(dim=1)
-        entropy = entropy.view(b, 1, h, w) / math.log(float(ksz * ksz))
+        # --- Diagnostics (masked / non-wrapping) ---
+        n_valid = valid.sum(dim=1).clamp_min(1.0)  # [B, HW]
+        ent_raw = -(weight.clamp_min(1e-8) * weight.clamp_min(1e-8).log()).sum(dim=1)
+        # Normalize by log(#valid candidates); single-candidate → entropy 0
+        log_n = n_valid.log()
+        entropy = torch.where(
+            n_valid <= 1.0 + 1e-6,
+            torch.zeros_like(ent_raw),
+            ent_raw / log_n.clamp_min(1e-8),
+        ).view(b, 1, h, w)
+
         max_w, _ = weight.max(dim=1)
         max_w = max_w.view(b, 1, h, w)
-        # expected similarity under soft weights
         exp_sim = (weight * sim).sum(dim=1).view(b, 1, h, w)
-        best_sim, _ = sim.max(dim=1)
+        # Best similarity over *valid* candidates only
+        sim_masked = sim.masked_fill(valid < 0.5, float('-inf'))
+        best_sim = sim_masked.max(dim=1).values
+        best_sim = torch.where(torch.isfinite(best_sim), best_sim, torch.zeros_like(best_sim))
         best_sim = best_sim.view(b, 1, h, w)
-        # displacement variance (approx)
+
         ex2 = (weight * (xx.reshape(1, -1, 1) ** 2)).sum(dim=1).view(b, 1, h, w)
         ey2 = (weight * (yy.reshape(1, -1, 1) ** 2)).sum(dim=1).view(b, 1, h, w)
         var = (ex2 - dx * dx).clamp_min(0) + (ey2 - dy * dy).clamp_min(0)
-        # spatial continuity of displacement
-        cont = (
-            (disp - torch.roll(disp, 1, dims=2)).abs().mean(dim=1, keepdim=True)
-            + (disp - torch.roll(disp, 1, dims=3)).abs().mean(dim=1, keepdim=True)
-        ) * 0.5
+
+        # Spatial continuity without toroidal wrap (no torch.roll)
+        cont = torch.zeros(b, 1, h, w, device=disp.device, dtype=disp.dtype)
+        cnt = torch.zeros_like(cont)
+        if h > 1:
+            d_v = (disp[:, :, 1:, :] - disp[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+            cont[:, :, :-1, :] = cont[:, :, :-1, :] + d_v
+            cont[:, :, 1:, :] = cont[:, :, 1:, :] + d_v
+            cnt[:, :, :-1, :] = cnt[:, :, :-1, :] + 1
+            cnt[:, :, 1:, :] = cnt[:, :, 1:, :] + 1
+        if w > 1:
+            d_h = (disp[:, :, :, 1:] - disp[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+            cont[:, :, :, :-1] = cont[:, :, :, :-1] + d_h
+            cont[:, :, :, 1:] = cont[:, :, :, 1:] + d_h
+            cnt[:, :, :, :-1] = cnt[:, :, :, :-1] + 1
+            cnt[:, :, :, 1:] = cnt[:, :, :, 1:] + 1
+        cont = cont / cnt.clamp_min(1.0)
 
         weight_map = weight.view(b, ksz * ksz, h, w)
         diag = dict(
@@ -126,8 +150,11 @@ class LocalSoftMatcher(nn.Module):
             best_sim=best_sim,
             disp_var=var,
             continuity=cont,
-            q_norm=q.norm(dim=1, keepdim=True),
+            q_norm=q.norm(dim=1, keepdim=True),          # post-L2 (≈1)
             k_norm=k.norm(dim=1, keepdim=True),
+            q_norm_pre=q_norm_pre,                        # pre-normalize
+            k_norm_pre=k_norm_pre,
+            n_valid=n_valid.view(b, 1, h, w),
         )
         return t, weight_map, diag
 

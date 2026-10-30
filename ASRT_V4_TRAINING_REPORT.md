@@ -30,10 +30,12 @@
 
 | Run | Steps | Best Dev PSNR (ref) | Notes |
 |---|---|---|---|
-| smoke | 40 | **21.57** SSIM 0.782 (n=30) | path OK; peak mem ~7.3 GB |
-| full `stage_b_v4` | **running** (PID live) | pending | launched after smoke; ~11 GB / 96% util @ step 50 |
+| smoke (pre-fix) | 40 | 21.57 (n=30) | obsolete — illum domain bug |
+| full `stage_b_v4` | ~800 then **stopped** | no mid ckpt | **discard**; do not resume |
+| smoke `stage_b_v4_fixed_smoke` | 60 | **21.94** SSIM 0.783 (n=30) | post-fix; `no_ref_prob=0.15` |
+| full `stage_b_v4_fixed` | not started here | — | start via config below |
 
-Early full-run logs (@50): `C_T` mean≈0.10, `C_L` mean≈0.36 (independent); texture residual norms leaving zero; `loss_ref`≠`loss_noref`. Full Dev comparison vs Stage A / B-v2 deferred until checkpoints mature — not claimed yet.
+Post-review training must use `configs/stage_b_v4_fixed.yaml` (fresh Stage A warm-start). See `ASRT_V4_FIX_REPORT.md`.
 
 ## Planned comparisons (same Dev IDs)
 

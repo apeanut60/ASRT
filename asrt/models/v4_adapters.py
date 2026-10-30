@@ -68,7 +68,7 @@ def rgb_to_luminance(x: torch.Tensor) -> torch.Tensor:
 
 
 class LowPassLuminance(nn.Module):
-    """Depthwise Gaussian-ish low-pass on luminance."""
+    """Gaussian low-pass on luminance. Input RGB must be in [0, 1]."""
 
     def __init__(self, ksize: int = 9, sigma: float = 3.0):
         super().__init__()
@@ -80,6 +80,12 @@ class LowPassLuminance(nn.Module):
         self.register_buffer('kernel', ker.view(1, 1, ksize, ksize), persistent=False)
         self.pad = ksize // 2
 
-    def forward(self, rgb: torch.Tensor) -> torch.Tensor:
-        lum = rgb_to_luminance(rgb)
-        return F.conv2d(lum, self.kernel, padding=self.pad)
+    def forward(self, rgb01: torch.Tensor) -> torch.Tensor:
+        """rgb01: [B,3,H,W] in [0,1] → luminance LPF [B,1,H,W] in ~[0,1]."""
+        lum = rgb_to_luminance(rgb01)
+        # Reflect pad avoids zero-pad dark borders on LPF
+        if min(lum.shape[-2:]) > self.pad:
+            lum = F.pad(lum, (self.pad, self.pad, self.pad, self.pad), mode='reflect')
+        else:
+            lum = F.pad(lum, (self.pad, self.pad, self.pad, self.pad), mode='replicate')
+        return F.conv2d(lum, self.kernel.to(dtype=lum.dtype), padding=0)

@@ -19,24 +19,18 @@ from asrt.data.manifest import load_manifest  # noqa: E402
 from asrt.data.paired import read_rgb_m11  # noqa: E402
 from asrt.evaluation.inference import infer_full  # noqa: E402
 from asrt.evaluation.metrics import psnr_ssim_rgb, to_uint8_rgb  # noqa: E402
-from asrt.models.asrt import build_asrt  # noqa: E402
+from asrt.models.factory import build_and_load  # noqa: E402
 
 
 def load_model(config, ckpt, device):
     cfg = yaml.safe_load(open(config)) if config else {}
-    model_cfg = dict(cfg.get('model', {}) or {})
-    if cfg.get('query_alignment') is not None:
-        model_cfg['query_align'] = dict(cfg['query_alignment'])
-    model = build_asrt(model_cfg).to(device)
-    ck = torch.load(ckpt, map_location=device)
-    state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
-    model.load_state_dict(state, strict=False)
+    model, report = build_and_load(cfg or {}, ckpt, device=device)
     model.eval()
-    return model, int(ck.get('step', -1)) if isinstance(ck, dict) else -1
+    return model, int(report.get('step', -1))
 
 
 def to_pil(t):
-    return Image.fromarray(to_uint8_rgb(t))
+    return Image.fromarray(to_uint8_rgb(t, input_range='minus_one_one'))
 
 
 def label_bar(width, text, height=28):
