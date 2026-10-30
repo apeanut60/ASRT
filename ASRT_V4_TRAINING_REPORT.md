@@ -28,12 +28,12 @@
 
 ## Status
 
-_Training launch and validation numbers are filled as runs complete. Do not treat pending cells as measured results._
-
 | Run | Steps | Best Dev PSNR (ref) | Notes |
 |---|---|---|---|
-| smoke | TBD | TBD | short trainer path check |
-| full `stage_b_v4` | TBD | TBD | |
+| smoke | 40 | **21.57** SSIM 0.782 (n=30) | path OK; peak mem ~7.3 GB |
+| full `stage_b_v4` | **running** (PID live) | pending | launched after smoke; ~11 GB / 96% util @ step 50 |
+
+Early full-run logs (@50): `C_T` mean≈0.10, `C_L` mean≈0.36 (independent); texture residual norms leaving zero; `loss_ref`≠`loss_noref`. Full Dev comparison vs Stage A / B-v2 deferred until checkpoints mature — not claimed yet.
 
 ## Planned comparisons (same Dev IDs)
 
