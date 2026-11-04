@@ -42,7 +42,7 @@ from asrt.training.seed_utils import (
     seed_worker,
 )
 
-PROTOCOL_VERSION = 'irp_v1_train_v2'
+PROTOCOL_VERSION = 'irp_v1_train_v3'
 
 
 def _stable_hash(obj: Any) -> str:
@@ -68,11 +68,27 @@ def git_meta(repo: Optional[str] = None) -> dict:
     return meta
 
 
-def validate_irp_cfg(cfg: dict, rows_train: List[dict], rows_val: Optional[List[dict]] = None):
+def _normalize_ref_mode(mode: str) -> str:
+    m = str(mode or 'correct').lower().replace('-', '_')
+    if m in ('none', 'no_ref'):
+        m = 'noref'
+    if m == 'shuffle':
+        m = 'pixel_shuffle'
+    return m
+
+
+def validate_irp_cfg(
+    cfg: dict,
+    rows_train: List[dict],
+    rows_val: Optional[List[dict]] = None,
+    *,
+    allow_non_correct_ref: bool = False,
+):
     if not is_irp_cfg(cfg):
         raise ValueError('config is not IRP')
     model = dict(cfg.get('model') or {})
     tr = dict(cfg.get('training') or {})
+    data = dict(cfg.get('data') or {})
     attn = dict(model.get('attention') or {})
     prior_source = str(model.get('prior_source', 'nano')).lower()
     n_feats = int(model.get('n_feats', 64))
@@ -95,6 +111,12 @@ def validate_irp_cfg(cfg: dict, rows_train: List[dict], rows_val: Optional[List[
         raise ValueError(
             'AMP requested but device=%r is not CUDA; refusing silent fake-AMP'
             % device)
+    ref_mode = _normalize_ref_mode(data.get('ref_mode', 'correct'))
+    if not allow_non_correct_ref and ref_mode != 'correct':
+        raise ValueError(
+            'formal IRP training requires data.ref_mode=correct; got %r. '
+            'Wrong/Shuffle/NoRef/Ref=Low are evaluation interventions only.'
+            % ref_mode)
     if prior_source == 'nano':
         missing = [r.get('sample_id') for r in rows_train if not r.get('ref_path')]
         if missing:
@@ -106,12 +128,33 @@ def validate_irp_cfg(cfg: dict, rows_train: List[dict], rows_val: Optional[List[
     return True
 
 
+def extract_validation_protocol(cfg: dict) -> dict:
+    """Configs that affect validation outputs / best-ckpt selection."""
+    from asrt.evaluation.protocol import resolve_eval_cfg
+    tr = dict(cfg.get('training') or {})
+    ev = resolve_eval_cfg(cfg)
+    return dict(
+        inference_mode=str(ev['inference_mode']),
+        irp_allow_tiled=bool(ev['irp_allow_tiled']),
+        irp_oom_policy=str(ev['irp_oom_policy']),
+        input_range=str(ev['input_range']),
+        tile=int(ev['tile']),
+        overlap=int(ev['overlap']),
+        full_max_side=int(ev['full_max_side']),
+        val_every=int(tr.get('val_every', 1000)),
+        val_max_images=tr.get('val_max_images', None),
+    )
+
+
 def extract_train_protocol(cfg: dict, *, train_hash: str = '', val_hash: str = '',
                            dataset_size: int = 0, halo: int = 0) -> dict:
     tr = dict(cfg.get('training') or {})
+    data = dict(cfg.get('data') or {})
     accum = max(1, int(tr.get('grad_accum', tr.get('accumulate', 1))))
     bs = int(tr.get('batch_size', 8))
     opt = str(tr.get('optimizer', 'adam')).lower()
+    ref_mode = _normalize_ref_mode(data.get('ref_mode', 'correct'))
+    val_proto = extract_validation_protocol(cfg)
     return dict(
         protocol_version=PROTOCOL_VERSION,
         optimizer=opt,
@@ -136,17 +179,13 @@ def extract_train_protocol(cfg: dict, *, train_hash: str = '', val_hash: str = '
         val_manifest_hash=str(val_hash),
         dataset_size=int(dataset_size),
         prior_source=str(dict(cfg.get('model') or {}).get('prior_source', '')),
+        ref_mode=ref_mode,
+        validation_protocol=val_proto,
+        validation_protocol_hash=_stable_hash(val_proto),
     )
 
 
-def compare_train_protocol(a: dict, b: dict) -> List[dict]:
-    keys = (
-        'protocol_version', 'optimizer', 'base_lr', 'weight_decay', 'betas',
-        'micro_batch_size', 'grad_accum', 'effective_batch_size', 'crop_size',
-        'halo', 'loss', 'scheduler', 'warmup_steps', 'max_steps', 'eta_min',
-        'amp', 'grad_clip', 'drop_last', 'seed', 'train_manifest_hash',
-        'val_manifest_hash', 'dataset_size', 'prior_source',
-    )
+def _compare_protocol_dicts(a: dict, b: dict, keys) -> List[dict]:
     conflicts = []
     for k in keys:
         if k not in a or k not in b:
@@ -154,6 +193,10 @@ def compare_train_protocol(a: dict, b: dict) -> List[dict]:
                                   reason='missing'))
             continue
         va, vb = a[k], b[k]
+        if isinstance(va, dict) and isinstance(vb, dict):
+            if _stable_hash(va) != _stable_hash(vb):
+                conflicts.append(dict(key=k, expected=va, got=vb))
+            continue
         if isinstance(va, (list, tuple)) or isinstance(vb, (list, tuple)):
             la = [float(x) if isinstance(x, (float, int)) else x for x in list(va)]
             lb = [float(x) if isinstance(x, (float, int)) else x for x in list(vb)]
@@ -165,6 +208,39 @@ def compare_train_protocol(a: dict, b: dict) -> List[dict]:
         elif va != vb:
             conflicts.append(dict(key=k, expected=va, got=vb))
     return conflicts
+
+
+def compare_train_protocol(a: dict, b: dict) -> List[dict]:
+    keys = (
+        'protocol_version', 'optimizer', 'base_lr', 'weight_decay', 'betas',
+        'micro_batch_size', 'grad_accum', 'effective_batch_size', 'crop_size',
+        'halo', 'loss', 'scheduler', 'warmup_steps', 'max_steps', 'eta_min',
+        'amp', 'grad_clip', 'drop_last', 'seed', 'train_manifest_hash',
+        'val_manifest_hash', 'dataset_size', 'prior_source', 'ref_mode',
+        'validation_protocol_hash',
+    )
+    conflicts = _compare_protocol_dicts(a, b, keys)
+    # Also expand validation_protocol field-level diffs when hashes disagree
+    if a.get('validation_protocol') and b.get('validation_protocol'):
+        if a.get('validation_protocol_hash') != b.get('validation_protocol_hash'):
+            vp_keys = (
+                'inference_mode', 'irp_allow_tiled', 'irp_oom_policy',
+                'input_range', 'tile', 'overlap', 'full_max_side',
+                'val_every', 'val_max_images',
+            )
+            conflicts.extend(_compare_protocol_dicts(
+                a['validation_protocol'], b['validation_protocol'],
+                vp_keys))
+    return conflicts
+
+
+def compare_validation_protocol(a: dict, b: dict) -> List[dict]:
+    keys = (
+        'inference_mode', 'irp_allow_tiled', 'irp_oom_policy',
+        'input_range', 'tile', 'overlap', 'full_max_side',
+        'val_every', 'val_max_images',
+    )
+    return _compare_protocol_dicts(a, b, keys)
 
 
 class WarmupCosineScheduler:
@@ -331,9 +407,16 @@ class IRPTrainer:
 
         self.rows_train = _load_rows(cfg, 'train')
         self.rows_val = _load_rows(cfg, 'val')
-        validate_irp_cfg(cfg, self.rows_train, self.rows_val)
+        allow_diag = bool(tr.get('allow_non_correct_ref', False) or
+                          cfg.get('allow_non_correct_ref', False))
+        validate_irp_cfg(
+            cfg, self.rows_train, self.rows_val,
+            allow_non_correct_ref=allow_diag)
+        self.ref_mode = _normalize_ref_mode(
+            dict(cfg.get('data') or {}).get('ref_mode', 'correct'))
         self.train_hash = manifest_hash(self.rows_train)
         self.val_hash = manifest_hash(self.rows_val)
+        self.validation_protocol = extract_validation_protocol(cfg)
         self.train_protocol = extract_train_protocol(
             cfg, train_hash=self.train_hash, val_hash=self.val_hash,
             dataset_size=len(self.rows_train), halo=self.halo)
@@ -353,7 +436,7 @@ class IRPTrainer:
             self.rows_train, crop=self.crop, seed=self.seed, augment=True,
             epoch=0, halo=self.halo, window_size=self.model.window_size,
             sigma=sigma, return_halo=True, require_ref=require_ref,
-            ref_mode=str(dict(cfg.get('data') or {}).get('ref_mode', 'correct')),
+            ref_mode=self.ref_mode,
             id_to_row={str(r['sample_id']): r for r in self.rows_train + self.rows_val},
         )
         self.ds_val = TripletIRPDataset(
@@ -610,6 +693,9 @@ class IRPTrainer:
             best_psnr=self.best_psnr,
             cfg=self.cfg,
             train_protocol=self.train_protocol,
+            validation_protocol=self.validation_protocol,
+            validation_protocol_hash=self.train_protocol.get('validation_protocol_hash'),
+            ref_mode=self.ref_mode,
             model_family='asrt_irp',
             model_version='irp_v1',
             prior_source=self.prior_source,
@@ -640,7 +726,9 @@ class IRPTrainer:
             self.model.load_state_dict(ck['model'], strict=True)
             return ck
 
-        # Model family / hparams
+        # --- Validate BEFORE mutating trainer state ---
+        if 'sampler_state' not in ck:
+            raise RuntimeError('checkpoint missing sampler_state; cannot resume data position')
         ck_hp = ck.get('irp_hparams') or extract_irp_hparams(ck.get('cfg') or {})
         model_hp = extract_irp_hparams(self.cfg)
         conflicts = compare_irp_hparams(ck_hp, model_hp)
@@ -648,25 +736,33 @@ class IRPTrainer:
             raise RuntimeError(
                 'IRP hparam mismatch on resume (not weights-only): %s' % conflicts)
 
-        # Training protocol
         ck_proto = ck.get('train_protocol')
         if ck_proto is None:
             raise RuntimeError(
                 'checkpoint missing train_protocol; refuse silent resume '
                 '(use weights_only=True for fine-tune load)')
+        # Backfill older checkpoints missing ref_mode / validation_protocol
+        if 'ref_mode' not in ck_proto:
+            ck_proto = dict(ck_proto)
+            ck_proto['ref_mode'] = _normalize_ref_mode(
+                (ck.get('cfg') or {}).get('data', {}).get('ref_mode', 'correct'))
+        if 'validation_protocol' not in ck_proto:
+            ck_proto = dict(ck_proto)
+            ck_proto['validation_protocol'] = extract_validation_protocol(
+                ck.get('cfg') or self.cfg)
+            ck_proto['validation_protocol_hash'] = _stable_hash(
+                ck_proto['validation_protocol'])
         proto_conflicts = compare_train_protocol(ck_proto, self.train_protocol)
         if proto_conflicts:
             raise RuntimeError(
                 'train protocol mismatch on resume: %s' % proto_conflicts)
 
-        if str(ck.get('protocol_version', '')) and str(
-                ck.get('protocol_version')) != PROTOCOL_VERSION:
-            # Allow loading v2-only; warn via exception if completely missing semantics
-            if 'global_step' not in ck and 'sampler_state' not in ck:
-                raise RuntimeError(
-                    'unsupported checkpoint protocol_version=%r'
-                    % ck.get('protocol_version'))
+        if 'global_step' not in ck and 'sampler_state' not in ck:
+            raise RuntimeError(
+                'unsupported checkpoint protocol_version=%r'
+                % ck.get('protocol_version'))
 
+        # --- Apply state ---
         self.model.load_state_dict(ck['model'], strict=True)
         self.opt.load_state_dict(ck['optimizer'])
         self.sched.load_state_dict(ck['scheduler'])
@@ -681,17 +777,13 @@ class IRPTrainer:
         self.best = ck.get('best')
         self.best_psnr = ck.get('best_psnr')
 
-        if 'sampler_state' in ck:
-            self.sampler.load_state_dict(ck['sampler_state'])
-        else:
-            raise RuntimeError('checkpoint missing sampler_state; cannot resume data position')
+        self.sampler.load_state_dict(ck['sampler_state'])
         self.ds_train.set_epoch(self.sampler.epoch)
         self.epoch = self.sampler.epoch
         self.batch_cursor = self.sampler.batch_cursor
         restore_rng_state(ck.get('rng_state') or ck.get('rng'))
         self.loader = self._make_loader()
         self.loader_iter = None
-        # Ensure LR matches next update
         self.sched.apply_lr(self.global_step)
         return ck
 

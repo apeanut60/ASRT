@@ -107,6 +107,9 @@ def main():
     # Explicit smoke path (engineering wiring; not formal training).
     if a.smoke_steps and not a.resume and a.max_steps is None:
         device = a.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        cfg.setdefault('training', {})['allow_non_correct_ref'] = True
+        print('SMOKE MODE ref_mode=%s (diagnostic; not formal training)' % ref_mode,
+              flush=True)
         run_smoke(cfg, device, a.smoke_steps, ref_mode)
         return
 
@@ -115,6 +118,14 @@ def main():
         raise SystemExit(
             'Pass --smoke_steps N for wiring check, or set training.max_steps / '
             '--max_steps for formal IRPTrainer (full 80k not started in repair task).')
+
+    # Formal training: ref_mode must be correct (eval interventions are separate).
+    if str(ref_mode).lower().replace('-', '_') not in ('correct',):
+        raise SystemExit(
+            'Formal IRP training rejects --ref_mode=%r / data.ref_mode=%r. '
+            'Use data.ref_mode=correct. Wrong/Shuffle/NoRef/Ref=Low are '
+            'evaluation-only interventions (or pass --smoke_steps for diagnostics).'
+            % (a.ref_mode, ref_mode))
 
     device = a.device or cfg.get('training', {}).get(
         'device', 'cuda' if torch.cuda.is_available() else 'cpu')

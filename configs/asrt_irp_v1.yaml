@@ -62,7 +62,7 @@ training:
   num_workers: 0
   drop_last: true
   device: cuda
-  protocol_version: irp_v1_train_v2
+  protocol_version: irp_v1_train_v3
 data:
   real_low: /root/data/datasets/lol-v2-real/Train/Low
   real_gt: /root/data/datasets/lol-v2-real/Train/Normal

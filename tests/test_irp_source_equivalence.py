@@ -60,11 +60,12 @@ def test_legacy_asrt_still_loads():
     ))
     try:
         m = build_model(legacy_cfg)
-    except Exception:
+    except (KeyError, ValueError, TypeError, AttributeError):
+        # Factory may not register legacy name; fall back to direct ctor.
         m = ASRT(n_feats=64, num_res_blocks='8+8+4+2')
     low = torch.randn(1, 3, 64, 64)
     with torch.no_grad():
-        y = m(low) if not isinstance(m, ASRT) else m(low)
+        y = m(low)
     assert y.shape == low.shape
 
 

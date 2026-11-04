@@ -1,14 +1,26 @@
 """Halo-aware synchronized crop for IRP training.
 
-Valid-region top/left are aligned to the full-image window grid:
-  (valid_top % window_size) == 0
-  (valid_left % window_size) == 0
+Attention window partition uses the *outer* (halo-inclusive) crop origin as
+(0,0). To keep H / H/2 / H/4 window phases aligned with a global lattice under
+exact factor-2 spatial mapping, outer crop origins use:
 
-Outer crop starts at (valid_top - halo, valid_left - halo) so HP/Sobel at the
-center match full-image computation.
+    alignment = window_size * 4   # e.g. 32 when window_size=8
+
+Halo is rounded up so:
+    halo >= prior_context (Gaussian radius + Sobel)
+    halo % alignment == 0
+
+Then:
+    outer_top % alignment == 0
+    valid_top = outer_top + halo   (also aligned when halo % alignment == 0)
+
+Note: CSFI uses stride-2 Conv with padding=1, which is not a pure G→G/2 map;
+exact bit-match to full-image windows is not claimed. This alignment removes
+the dominant phase offset from outer≠valid origins.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -18,15 +30,23 @@ import torch.nn.functional as F
 from asrt.models.prior_ops import prior_context_halo
 
 
+def window_grid_alignment(window_size: int = 8) -> int:
+    """Full-res crop alignment for H + H/2 + H/4 window lattices."""
+    return max(1, int(window_size) * 4)
+
+
 def compute_irp_halo(
     sigma: float = 7.0,
     window_size: int = 8,
     sobel: int = 1,
     extra: int = 0,
 ) -> int:
-    """Halo (pixels) for prior ops. Window alignment uses valid_* coords, not halo."""
-    base = prior_context_halo(sigma=sigma, sobel=sobel)
-    return int(base + int(extra))
+    """Halo ≥ prior context, rounded up to window_grid_alignment."""
+    base = int(prior_context_halo(sigma=sigma, sobel=sobel) + int(extra))
+    align = window_grid_alignment(window_size)
+    if base <= 0:
+        return align
+    return int(math.ceil(base / float(align)) * align)
 
 
 def sync_geometry_halo(
@@ -39,10 +59,9 @@ def sync_geometry_halo(
 ) -> Dict[str, object]:
     """Shared random crop with halo context + flips/rotations.
 
-    Meta includes:
-      valid_top / valid_left — start of the loss region in the (padded) image
-      outer_top / outer_left — start of the halo-inclusive crop
-      top/left — aliases of outer_* (legacy)
+    When align_valid_to_window=True (default for IRP train):
+      outer_top/left snapped to alignment = window_size*4
+      valid_* = outer_* + halo
     """
     assert len(tensors) >= 1
     halo = max(0, int(halo))
@@ -57,49 +76,34 @@ def sync_geometry_halo(
             for t in tensors]
     _, h, w = tensors[0].shape
 
-    # Valid region must fit with halo margins on all sides.
-    max_valid_top = h - crop - halo
-    max_valid_left = w - crop - halo
-    min_valid_top = halo
-    min_valid_left = halo
-    if max_valid_top < min_valid_top or max_valid_left < min_valid_left:
+    align = window_grid_alignment(window_size) if align_valid_to_window else 1
+    ws = max(1, int(window_size))
+
+    # Outer crop must fit: [0, h - (crop+2*halo)]
+    max_outer_top = h - (crop + 2 * halo)
+    max_outer_left = w - (crop + 2 * halo)
+    if max_outer_top < 0 or max_outer_left < 0:
         raise RuntimeError('image too small for crop+halo')
 
-    ws = max(1, int(window_size))
-    if align_valid_to_window and ws > 1:
-        # valid_top ≡ 0 (mod ws) relative to image origin (after pad).
-        top_candidates = list(range(
-            ((min_valid_top + ws - 1) // ws) * ws,
-            max_valid_top + 1,
-            ws,
-        ))
-        left_candidates = list(range(
-            ((min_valid_left + ws - 1) // ws) * ws,
-            max_valid_left + 1,
-            ws,
-        ))
+    if align_valid_to_window and align > 1:
+        top_candidates = list(range(0, max_outer_top + 1, align))
+        left_candidates = list(range(0, max_outer_left + 1, align))
         if not top_candidates or not left_candidates:
-            # Fall back: clamp nearest aligned positions inside range
-            vt = max(min_valid_top, min(max_valid_top, (min_valid_top // ws) * ws))
-            vl = max(min_valid_left, min(max_valid_left, (min_valid_left // ws) * ws))
-            # If still misaligned, disable strict align for this sample
-            if vt % ws != 0 or vt < min_valid_top or vt > max_valid_top:
-                vt = int(rng.randint(min_valid_top, max_valid_top + 1))
-            if vl % ws != 0 or vl < min_valid_left or vl > max_valid_left:
-                vl = int(rng.randint(min_valid_left, max_valid_left + 1))
-            valid_top, valid_left = int(vt), int(vl)
-            aligned = (valid_top % ws == 0) and (valid_left % ws == 0)
+            # Cannot satisfy full multi-scale align; fall back to any outer
+            outer_top = int(rng.randint(0, max_outer_top + 1))
+            outer_left = int(rng.randint(0, max_outer_left + 1))
+            aligned = False
         else:
-            valid_top = int(top_candidates[int(rng.randint(0, len(top_candidates)))])
-            valid_left = int(left_candidates[int(rng.randint(0, len(left_candidates)))])
+            outer_top = int(top_candidates[int(rng.randint(0, len(top_candidates)))])
+            outer_left = int(left_candidates[int(rng.randint(0, len(left_candidates)))])
             aligned = True
     else:
-        valid_top = int(rng.randint(min_valid_top, max_valid_top + 1))
-        valid_left = int(rng.randint(min_valid_left, max_valid_left + 1))
+        outer_top = int(rng.randint(0, max_outer_top + 1))
+        outer_left = int(rng.randint(0, max_outer_left + 1))
         aligned = False
 
-    outer_top = valid_top - halo
-    outer_left = valid_left - halo
+    valid_top = outer_top + halo
+    valid_left = outer_left + halo
     y1 = outer_top + crop + 2 * halo
     x1 = outer_left + crop + 2 * halo
     out_halo = [t[:, outer_top:y1, outer_left:x1] for t in tensors]
@@ -116,11 +120,12 @@ def sync_geometry_halo(
 
     out_valid = [t[:, halo:halo + crop, halo:halo + crop] for t in out_halo]
     meta = dict(
-        # legacy aliases: outer crop origin
         top=outer_top, left=outer_left,
         outer_top=outer_top, outer_left=outer_left,
         valid_top=valid_top, valid_left=valid_left,
-        valid_aligned=bool(aligned and align_valid_to_window),
+        valid_aligned=bool(aligned),
+        outer_aligned=bool(aligned),
+        alignment=int(align),
         halo=halo, crop=crop,
         flip_w=flip_w, flip_h=flip_h, rot_k=rot_k,
         window_size=ws, pad_h=pad_h, pad_w=pad_w,
