@@ -9,7 +9,7 @@
 
 ## 1. Git commit & modified files
 
-*(Commit hash filled after `git commit` in this delivery.)*
+**Commit:** `c4701eb44136e63de8accae7aa7b981488c86e71`
 
 **Files changed:**
 
