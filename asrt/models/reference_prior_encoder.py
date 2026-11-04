@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from asrt.evaluation.reference_information import high_pass
+from asrt.models.prior_ops import high_pass
 
 
 def sobel_magnitude(img01: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

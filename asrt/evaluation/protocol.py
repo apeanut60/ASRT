@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from asrt.evaluation.inference import infer_full, infer_tiled
+from asrt.evaluation.inference import infer_full, infer_tiled, is_irp_model
 
 
 def resolve_eval_cfg(cfg: Optional[dict] = None) -> Dict[str, Any]:
@@ -13,6 +13,9 @@ def resolve_eval_cfg(cfg: Optional[dict] = None) -> Dict[str, Any]:
 
     Defaults preserve historical Trainer auto behavior:
       inference_mode=auto, full_max_side=512, tile=256, overlap=32
+
+    IRP formal PSNR defaults to full-image unless
+    evaluation.irp_allow_tiled=true (experimental; not bit-exact vs full).
     """
     cfg = dict(cfg or {})
     ev = dict(cfg.get('evaluation') or {})
@@ -29,6 +32,8 @@ def resolve_eval_cfg(cfg: Optional[dict] = None) -> Dict[str, Any]:
         tile=int(ev.get('tile', cfg.get('eval_tile', 256))),
         overlap=int(ev.get('overlap', cfg.get('eval_overlap', 32))),
         input_range=str(ev.get('input_range', 'minus_one_one')),
+        irp_allow_tiled=bool(ev.get('irp_allow_tiled', False)),
+        irp_oom_policy=str(ev.get('irp_oom_policy', 'error')).lower(),
     )
 
 
@@ -45,14 +50,36 @@ def infer_with_protocol(model, low, ref=None, eval_cfg: Optional[dict] = None):
         use_tile = False
     else:  # auto
         use_tile = max(H, W) > int(ev['full_max_side'])
-    if use_tile:
-        pred = infer_tiled(
-            model, low, ref,
-            tile=int(ev['tile']), overlap=int(ev['overlap']))
-        used = 'tiled'
-    else:
-        pred = infer_full(model, low, ref)
-        used = 'full'
+
+    # Formal IRP eval: force full-image unless explicitly opted into experimental tiled.
+    if is_irp_model(model) and use_tile and not ev['irp_allow_tiled']:
+        use_tile = False
+        # If image is huge and user asked for tiled without allow flag, fail clearly
+        # when they set inference_mode=tiled (not auto).
+        if mode == 'tiled':
+            raise RuntimeError(
+                'IRP formal evaluation refuses unverified tiled inference. '
+                'Use evaluation.inference_mode=full, or set '
+                'evaluation.irp_allow_tiled=true for experimental tiled '
+                '(Full/Tiled are not claimed bit-exact).')
+
+    try:
+        if use_tile:
+            pred = infer_tiled(
+                model, low, ref,
+                tile=int(ev['tile']), overlap=int(ev['overlap']))
+            used = 'tiled'
+        else:
+            pred = infer_full(model, low, ref)
+            used = 'full'
+    except RuntimeError as e:
+        if is_irp_model(model) and 'out of memory' in str(e).lower():
+            if ev['irp_oom_policy'] == 'error':
+                raise RuntimeError(
+                    'IRP full-image inference OOM; refusing silent tiled fallback. '
+                    'Reduce batch or enable experimental irp_allow_tiled after '
+                    'reviewing Full/Tiled error stats.') from e
+        raise
     meta = dict(
         inference_mode=mode,
         inference_used=used,
@@ -60,5 +87,6 @@ def infer_with_protocol(model, low, ref=None, eval_cfg: Optional[dict] = None):
         overlap=int(ev['overlap']),
         full_max_side=int(ev['full_max_side']),
         input_hw=(H, W),
+        irp_allow_tiled=bool(ev['irp_allow_tiled']),
     )
     return pred, meta

@@ -6,7 +6,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from asrt.models.asrt import ASRT, build_asrt
-from asrt.models.asrt_irp import ASRTIRP, build_asrt_irp
+from asrt.models.asrt_irp import (
+    ASRTIRP,
+    build_asrt_irp,
+    extract_irp_hparams,
+    extract_irp_hparams_from_model,
+)
 from asrt.models.asrt_v4 import ASRTv4, build_asrt_v4
 
 # Non-weight hyperparams that change v4 forward results
@@ -14,6 +19,14 @@ _V4_HPARAM_KEYS = (
     'version', 'n_feats', 'num_res_blocks', 'enable_lightup',
     'match_dim', 'match_radius', 'match_temperature', 'match_lambda_pos',
     'ref_base_ch', 'reli_mid',
+)
+
+# IRP identity / structure keys that must match at load time
+_IRP_HPARAM_KEYS = (
+    'model_family', 'model_version', 'prior_source', 'n_feats',
+    'num_res_blocks', 'enable_lightup', 'attention_type',
+    'attention_heads', 'attention_window_size',
+    'reference_prior_gaussian_sigma', 'irp_alpha_init', 'irp_beta_init',
 )
 
 
@@ -64,16 +77,61 @@ def is_v4_cfg(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None) -> b
     return stage in ('b_v4', 'stage_b_v4', 'v4')
 
 
+def is_irp_cfg(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None) -> bool:
+    cfg = dict(cfg or {})
+    model_cfg = dict(model_cfg or cfg.get('model') or {})
+    name = str(model_cfg.get('name', '')).lower()
+    ver = str(model_cfg.get('version', '')).lower()
+    stage = str(cfg.get('stage', '')).lower()
+    fam = str(model_cfg.get('model_family', '')).lower()
+    if fam in ('asrt_irp', 'irp'):
+        return True
+    if name in ('asrt_irp_v1', 'asrt_irp', 'irp', 'irp_v1'):
+        return True
+    if ver in ('irp', 'irp_v1', 'vnext', 'vnext_v1'):
+        return True
+    return stage in ('irp', 'irp_v1', 'vnext')
+
+
+def compare_irp_hparams(a: dict, b: dict) -> List[dict]:
+    conflicts = []
+    for k in _IRP_HPARAM_KEYS:
+        if k not in a or k not in b:
+            continue
+        va, vb = a[k], b[k]
+        if isinstance(va, float) or isinstance(vb, float):
+            if abs(float(va) - float(vb)) > 1e-8:
+                conflicts.append(dict(key=k, expected=va, got=vb))
+        else:
+            if str(va) != str(vb):
+                conflicts.append(dict(key=k, expected=va, got=vb))
+    return conflicts
+
+
 def detect_ckpt_version(state: dict, ckpt_meta: Optional[dict] = None) -> str:
-    """Infer model family from state_dict keys / cfg blob."""
+    """Infer model family from state_dict keys / cfg blob.
+
+    Returns: 'irp_v1' | 'v4' | 'v3' | 'legacy'
+    """
     if ckpt_meta and isinstance(ckpt_meta, dict):
+        # Explicit IRP identity in checkpoint meta
+        fam = str(ckpt_meta.get('model_family', '')).lower()
+        ver = str(ckpt_meta.get('model_version', '')).lower()
+        if fam in ('asrt_irp', 'irp') or ver in ('irp_v1', 'irp', 'vnext_v1'):
+            return 'irp_v1'
         cfg = ckpt_meta.get('cfg') or {}
         model_cfg = dict(cfg.get('model') or {})
+        if is_irp_cfg(cfg, model_cfg):
+            return 'irp_v1'
         if is_v4_cfg(cfg, model_cfg):
             return 'v4'
         if bool(model_cfg.get('enable_v3', False)):
             return 'v3'
     keys = list(state.keys())
+    # IRP markers (new modules; not present in Stage A / v4)
+    if any('illum_prior_encoder' in k for k in keys) or any(
+            'coarse_irp' in k or 'middle_irp' in k or 'fine_irp' in k for k in keys):
+        return 'irp_v1'
     if any(k.startswith('ref_encoder.') for k in keys) or any(
             k.startswith('matcher.') for k in keys):
         return 'v4'
@@ -81,19 +139,6 @@ def detect_ckpt_version(state: dict, ckpt_meta: Optional[dict] = None) -> str:
             'coarse_illum_adapter' in k for k in keys):
         return 'v3'
     return 'legacy'
-
-
-def is_irp_cfg(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None) -> bool:
-    cfg = dict(cfg or {})
-    model_cfg = dict(model_cfg or cfg.get('model') or {})
-    name = str(model_cfg.get('name', '')).lower()
-    ver = str(model_cfg.get('version', '')).lower()
-    stage = str(cfg.get('stage', '')).lower()
-    if name in ('asrt_irp_v1', 'asrt_irp', 'irp', 'irp_v1'):
-        return True
-    if ver in ('irp', 'irp_v1', 'vnext', 'vnext_v1'):
-        return True
-    return stage in ('irp', 'irp_v1', 'vnext')
 
 
 def build_model(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None):
@@ -119,8 +164,8 @@ def load_checkpoint_strict(
 ) -> Dict[str, Any]:
     """Load checkpoint with strict=True. Returns load report.
 
-    For v4, also compares non-weight hyperparams in ckpt cfg vs external_cfg /
-    model.v4_hparams. Conflicts raise unless allow_hparam_override=True.
+    For v4/IRP, compares non-weight hyperparams in ckpt vs model/external cfg.
+    Conflicts raise unless allow_hparam_override=True (diagnostics only).
     Legacy checkpoints without full cfg get a compatibility note (no hard fail).
     """
     ck = torch.load(ckpt_path, map_location=device)
@@ -135,17 +180,55 @@ def load_checkpoint_strict(
             % (expect_version, detected, ckpt_path))
 
     model_is_v4 = bool(getattr(model, 'is_v4', False))
+    model_is_irp = bool(getattr(model, 'is_irp', False))
     if detected == 'v4' and not model_is_v4:
         raise RuntimeError(
             'refusing to load v4 checkpoint into non-v4 model (would silent-fail)')
     if model_is_v4 and detected != 'v4':
         raise RuntimeError(
             'refusing to load non-v4 checkpoint into ASRTv4 with strict eval loader')
+    if detected == 'irp_v1' and not model_is_irp:
+        raise RuntimeError(
+            'refusing to load IRP checkpoint into non-IRP model')
+    if model_is_irp and detected != 'irp_v1':
+        raise RuntimeError(
+            'refusing to load non-IRP checkpoint into ASRTIRP '
+            '(detected=%s)' % detected)
 
     hparam_conflicts: List[dict] = []
     hparam_note = None
+    hparam_overrides_applied: List[dict] = []
     ckpt_cfg = ck.get('cfg') if isinstance(ck, dict) else None
-    if model_is_v4:
+    if model_is_irp:
+        model_hp = dict(getattr(model, 'irp_hparams', None)
+                        or extract_irp_hparams_from_model(model))
+        ckpt_hp = None
+        if isinstance(ck, dict) and isinstance(ck.get('irp_hparams'), dict):
+            ckpt_hp = dict(ck['irp_hparams'])
+        elif ckpt_cfg and isinstance(ckpt_cfg, dict):
+            ckpt_hp = extract_irp_hparams(ckpt_cfg)
+        if ckpt_hp is None:
+            raise RuntimeError(
+                'IRP checkpoint missing irp_hparams/cfg; refusing silent load. '
+                'Pass allow_hparam_override only for explicit legacy diagnostics.')
+        # Ensure family tags present
+        ckpt_hp.setdefault('model_family', 'asrt_irp')
+        ckpt_hp.setdefault('model_version', 'irp_v1')
+        hparam_conflicts = compare_irp_hparams(ckpt_hp, model_hp)
+        if external_cfg:
+            ext_hp = extract_irp_hparams(external_cfg)
+            hparam_conflicts += compare_irp_hparams(ckpt_hp, ext_hp)
+        if hparam_conflicts and not allow_hparam_override:
+            raise RuntimeError(
+                'IRP hyperparam mismatch vs checkpoint (incl. prior_source). '
+                'A3 Correct/Wrong/Shuffle/Ref=Low/NoRef must keep prior_source=nano '
+                'and only change the Ref tensor. Conflicts: %s' % hparam_conflicts)
+        if hparam_conflicts and allow_hparam_override:
+            hparam_overrides_applied = list(hparam_conflicts)
+            hparam_note = (
+                'DIAGNOSTIC OVERRIDE: loaded IRP weights despite hparam conflicts: %s'
+                % hparam_overrides_applied)
+    elif model_is_v4:
         model_hp = dict(getattr(model, 'v4_hparams', {}) or {})
         if ckpt_cfg and isinstance(ckpt_cfg, dict) and ckpt_cfg.get('model'):
             ckpt_hp = _extract_v4_hparams(ckpt_cfg)
@@ -172,6 +255,9 @@ def load_checkpoint_strict(
     report = dict(
         path=ckpt_path,
         version=detected,
+        model_family=('asrt_irp' if detected == 'irp_v1'
+                      else ('asrt_v4' if detected == 'v4' else detected)),
+        model_version=detected,
         step=step,
         params=n_params,
         trainable=n_train,
@@ -179,6 +265,7 @@ def load_checkpoint_strict(
         unexpected=list(unexpected),
         hparam_conflicts=hparam_conflicts,
         hparam_override=bool(allow_hparam_override and hparam_conflicts),
+        hparam_overrides_applied=hparam_overrides_applied,
         hparam_note=hparam_note,
     )
     return report
@@ -195,8 +282,18 @@ def build_and_load(
     ck = torch.load(ckpt_path, map_location='cpu')
     if not cfg and isinstance(ck, dict) and isinstance(ck.get('cfg'), dict):
         cfg = dict(ck['cfg'])
-    # Prefer checkpoint cfg for v4 construction when both present and no override
+    # Prefer checkpoint cfg for IRP/v4 construction when both present and no override
     if (isinstance(ck, dict) and isinstance(ck.get('cfg'), dict)
+            and is_irp_cfg(ck['cfg']) and not allow_hparam_override):
+        if cfg and is_irp_cfg(cfg):
+            conflicts = compare_irp_hparams(
+                extract_irp_hparams(ck['cfg']), extract_irp_hparams(cfg))
+            if conflicts:
+                raise RuntimeError(
+                    'external config conflicts with checkpoint IRP hparams: %s'
+                    % conflicts)
+        cfg = dict(ck['cfg'])
+    elif (isinstance(ck, dict) and isinstance(ck.get('cfg'), dict)
             and is_v4_cfg(ck['cfg']) and not allow_hparam_override):
         if cfg and is_v4_cfg(cfg):
             conflicts = compare_v4_hparams(
@@ -207,11 +304,18 @@ def build_and_load(
                     % conflicts)
         cfg = dict(ck['cfg'])
     model = build_model(cfg).to(device)
-    expect = 'v4' if getattr(model, 'is_v4', False) else None
+    expect = None
+    if getattr(model, 'is_irp', False):
+        expect = 'irp_v1'
+    elif getattr(model, 'is_v4', False):
+        expect = 'v4'
     if expect is None:
         state = ck['model'] if isinstance(ck, dict) and 'model' in ck else ck
         detected = detect_ckpt_version(state, ck if isinstance(ck, dict) else None)
-        if detected == 'v4':
+        if detected == 'irp_v1':
+            model = build_asrt_irp(cfg).to(device)
+            expect = 'irp_v1'
+        elif detected == 'v4':
             model = build_asrt_v4(dict(cfg.get('model') or {})).to(device)
             expect = 'v4'
     report = load_checkpoint_strict(

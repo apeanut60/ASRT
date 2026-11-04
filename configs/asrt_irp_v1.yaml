@@ -1,11 +1,12 @@
 # ASRT vNext V1 — Illumination–Reference Prior Modulated Restoration
-# Formal training hyperparameters are frozen after architecture smoke tests.
+# Formal training hyperparameters are candidates; freeze before 80k run.
 stage: irp_v1
 out_dir: /root/data/experiments/ASRT/irp_v1
 seed: 42
 model:
   name: asrt_irp_v1
   version: irp_v1
+  model_family: asrt_irp
   n_feats: 64
   num_res_blocks: "8+8+4+2"
   enable_lightup: true
@@ -36,19 +37,43 @@ model:
   use_ttsr_matching: false
 training:
   seed: 42
-  optimizer: adamw
+  optimizer: adam
   learning_rate: 0.0001
   weight_decay: 0.0001
+  betas: [0.9, 0.999]
   loss: mse
   batch_size: 8
   crop_size: 128
+  # halo auto = gaussian_radius(7)+sobel(+window margin via compute_irp_halo)
+  halo: null
   amp: true
-  # Formal training not started in the implementation task.
+  grad_clip: 1.0
+  grad_accum: 1
+  warmup_steps: 1000
+  eta_min: 1.0e-6
+  # Formal 80k not started in the repair task — set explicitly to launch.
   max_steps: null
+  val_every: 1000
+  ckpt_every: 2000
+  log_every: 50
+  num_workers: 2
+  drop_last: true
+  device: cuda
 data:
   real_low: /root/data/datasets/lol-v2-real/Train/Low
   real_gt: /root/data/datasets/lol-v2-real/Train/Normal
   real_ref: /root/data/datasets/lol-v2-real/Train/nanobanana_ref_v2
   manifest_root: /root/data/experiments/ASRT/manifests
-  # Reference Prior input only: correct|wrong|shuffle|ref_low|noref
+  train_manifest: lolv2_real_triplet_train.json
+  val_manifest: lolv2_real_triplet_dev.json
+  # Training uses Correct only. Eval diagnostics: wrong|patch_shuffle|pixel_shuffle|ref_low|noref
   ref_mode: correct
+evaluation:
+  inference_mode: full
+  full_max_side: 100000
+  tile: 256
+  overlap: 32
+  # Experimental only; formal PSNR must stay full-image unless reviewed.
+  irp_allow_tiled: false
+  irp_oom_policy: error
+  input_range: minus_one_one
