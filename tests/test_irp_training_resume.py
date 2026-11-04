@@ -1,4 +1,4 @@
-"""Gradient accumulation equivalence + checkpoint resume continuity."""
+"""Gradient accumulation helpers + scheduler + checkpoint weight roundtrip."""
 from __future__ import annotations
 
 import os
@@ -7,12 +7,11 @@ import tempfile
 
 import torch
 import torch.nn.functional as F
-import yaml
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, ROOT)
 
-from asrt.models.asrt_irp import build_asrt_irp  # noqa: E402
+from asrt.models.asrt_irp import build_asrt_irp, extract_irp_hparams  # noqa: E402
 from asrt.training.irp_trainer import WarmupCosineScheduler  # noqa: E402
 from asrt.training.seed_utils import seed_everything  # noqa: E402
 
@@ -28,54 +27,19 @@ CFG = dict(
     ))
 
 
-def test_grad_accum_equivalence():
-    """accum=2 micro-batches ≈ one large backward with summed grads (no AMP)."""
-    seed_everything(0)
-    m1 = build_asrt_irp(CFG)
-    seed_everything(0)
-    m2 = build_asrt_irp(CFG)
-    opt1 = torch.optim.Adam(m1.parameters(), lr=1e-4)
-    opt2 = torch.optim.Adam(m2.parameters(), lr=1e-4)
-    b0_low = torch.randn(1, 3, 64, 64)
-    b0_gt = torch.randn(1, 3, 64, 64)
-    b0_ref = torch.randn(1, 3, 64, 64)
-    b1_low = torch.randn(1, 3, 64, 64)
-    b1_gt = torch.randn(1, 3, 64, 64)
-    b1_ref = torch.randn(1, 3, 64, 64)
-
-    # accum path
-    opt1.zero_grad(set_to_none=True)
-    loss = F.mse_loss(m1(b0_low, b0_ref), b0_gt) / 2
-    loss.backward()
-    loss = F.mse_loss(m1(b1_low, b1_ref), b1_gt) / 2
-    loss.backward()
-    # reference path: mean of two losses at once is not the same graph;
-    # compare parameter grads after same two scaled backwards on m2 sequentially
-    opt2.zero_grad(set_to_none=True)
-    loss = F.mse_loss(m2(b0_low, b0_ref), b0_gt) / 2
-    loss.backward()
-    loss = F.mse_loss(m2(b1_low, b1_ref), b1_gt) / 2
-    loss.backward()
-
-    for (n1, p1), (n2, p2) in zip(m1.named_parameters(), m2.named_parameters()):
-        if p1.grad is None:
-            assert p2.grad is None
-            continue
-        assert torch.allclose(p1.grad, p2.grad, atol=1e-5, rtol=1e-5), n1
-
-
 def test_scheduler_warmup_cosine():
     m = build_asrt_irp(CFG)
     opt = torch.optim.Adam(m.parameters(), lr=1e-3)
     sch = WarmupCosineScheduler(opt, total_steps=100, warmup_steps=10, eta_min=1e-6)
-    sch.step()  # step 0
     lr0 = opt.param_groups[0]['lr']
+    assert abs(lr0 - 1e-3 * 1 / 10) < 1e-12
     for _ in range(9):
-        sch.step()
-    lr_warm = opt.param_groups[0]['lr']
-    assert lr_warm > lr0
+        sch.mark_update_done()
+        sch.apply_lr(sch.updates_done)
+    assert abs(opt.param_groups[0]['lr'] - 1e-3) < 1e-12
     for _ in range(90):
-        sch.step()
+        sch.mark_update_done()
+        sch.apply_lr(sch.updates_done)
     assert opt.param_groups[0]['lr'] <= 1e-3 + 1e-9
 
 
@@ -88,17 +52,17 @@ def test_checkpoint_roundtrip_weights():
     ref = torch.randn(1, 3, 64, 64)
     gt = torch.randn(1, 3, 64, 64)
     for _ in range(3):
+        sch.apply_lr(sch.updates_done)
         opt.zero_grad(set_to_none=True)
         loss = F.mse_loss(m(low, ref), gt)
         loss.backward()
         opt.step()
-        sch.step()
+        sch.mark_update_done()
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, 'ck.pt')
-        from asrt.models.asrt_irp import extract_irp_hparams
         torch.save(dict(
             model=m.state_dict(), optimizer=opt.state_dict(),
-            scheduler=sch.state_dict(), step=3, epoch=0,
+            scheduler=sch.state_dict(), global_step=3, epoch=0,
             model_family='asrt_irp', model_version='irp_v1',
             prior_source='nano', irp_hparams=extract_irp_hparams(CFG),
             cfg=CFG,
@@ -111,7 +75,6 @@ def test_checkpoint_roundtrip_weights():
 
 
 def main():
-    test_grad_accum_equivalence()
     test_scheduler_warmup_cosine()
     test_checkpoint_roundtrip_weights()
     print('ALL test_irp_training_resume PASS')

@@ -181,7 +181,9 @@ class TripletIRPDataset(Dataset):
             halo=int(meta.get('halo', 0)),
             crop=int(meta.get('crop', self.crop)),
             aug_meta={k: meta[k] for k in (
-                'top', 'left', 'flip_w', 'flip_h', 'rot_k', 'halo', 'crop')
+                'top', 'left', 'outer_top', 'outer_left',
+                'valid_top', 'valid_left', 'valid_aligned',
+                'flip_w', 'flip_h', 'rot_k', 'halo', 'crop', 'window_size')
                 if k in meta},
             ref_mode=self.ref_mode,
             domain=row.get('domain', ''),

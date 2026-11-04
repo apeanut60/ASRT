@@ -51,14 +51,18 @@ training:
   grad_accum: 1
   warmup_steps: 1000
   eta_min: 1.0e-6
-  # Formal 80k not started in the repair task — set explicitly to launch.
+  # max_steps = Optimizer Update count (not micro-batches).
+  # Formal 80k not started in this task — set explicitly to launch.
   max_steps: null
+  # Checkpoints / val / log periods are in global_step (optimizer updates).
   val_every: 1000
   ckpt_every: 2000
   log_every: 50
-  num_workers: 2
+  # Prefer 0 for bit-exact resume tests; >0 allowed with documented limits.
+  num_workers: 0
   drop_last: true
   device: cuda
+  protocol_version: irp_v1_train_v2
 data:
   real_low: /root/data/datasets/lol-v2-real/Train/Low
   real_gt: /root/data/datasets/lol-v2-real/Train/Normal

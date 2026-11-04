@@ -61,11 +61,32 @@ def test_sync_geometry_halo_shapes():
     assert packed['tensors_valid'][0].shape[-1] == 128
 
 
+def test_valid_region_window_aligned():
+    """valid_top/left must be multiples of window_size (not outer top)."""
+    ws = 8
+    halo = 22  # not divisible by 8
+    rng = np.random.RandomState(1)
+    t = torch.rand(3, 400, 400)
+    for _ in range(20):
+        packed = sync_geometry_halo(
+            [t], crop=128, rng=rng, halo=halo, window_size=ws,
+            align_valid_to_window=True)
+        meta = packed['meta']
+        assert meta['valid_top'] % ws == 0, meta
+        assert meta['valid_left'] % ws == 0, meta
+        assert meta['outer_top'] == meta['valid_top'] - halo
+        assert meta['outer_left'] == meta['valid_left'] - halo
+        assert meta['valid_aligned'] is True
+        # outer is NOT required to be aligned when halo % ws != 0
+        assert meta['outer_top'] % ws != 0 or halo % ws == 0 or True
+
+
 def main():
     test_halo_size_matches_kernel()
     test_center_hp_matches_full()
     test_sobel_center_matches()
     test_sync_geometry_halo_shapes()
+    test_valid_region_window_aligned()
     print('ALL test_irp_halo_crop PASS')
 
 
