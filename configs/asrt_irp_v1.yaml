@@ -1,0 +1,54 @@
+# ASRT vNext V1 — Illumination–Reference Prior Modulated Restoration
+# Formal training hyperparameters are frozen after architecture smoke tests.
+stage: irp_v1
+out_dir: /root/data/experiments/ASRT/irp_v1
+seed: 42
+model:
+  name: asrt_irp_v1
+  version: irp_v1
+  n_feats: 64
+  num_res_blocks: "8+8+4+2"
+  enable_lightup: true
+  prior_source: nano   # none | low | nano
+  load_stage_a_checkpoint: false
+  attention:
+    type: window_spatial
+    heads: 4
+    window_size: 8
+  illumination_prior:
+    enabled: true
+    type: low_max_channel
+  reference_prior:
+    enabled: true
+    type: structural_detail
+    gaussian_sigma: 7.0
+    use_highpass: true
+    use_sobel_ref: true
+    use_sobel_low: true
+  irp:
+    coarse: illumination_only
+    middle: dual_prior
+    fine: dual_prior
+    alpha_init: 1.0
+    beta_init: 0.1
+  use_moe: false
+  use_cross_attention: false
+  use_ttsr_matching: false
+training:
+  seed: 42
+  optimizer: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  loss: mse
+  batch_size: 8
+  crop_size: 128
+  amp: true
+  # Formal training not started in the implementation task.
+  max_steps: null
+data:
+  real_low: /root/data/datasets/lol-v2-real/Train/Low
+  real_gt: /root/data/datasets/lol-v2-real/Train/Normal
+  real_ref: /root/data/datasets/lol-v2-real/Train/nanobanana_ref_v2
+  manifest_root: /root/data/experiments/ASRT/manifests
+  # Reference Prior input only: correct|wrong|shuffle|ref_low|noref
+  ref_mode: correct

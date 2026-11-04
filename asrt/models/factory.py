@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from asrt.models.asrt import ASRT, build_asrt
+from asrt.models.asrt_irp import ASRTIRP, build_asrt_irp
 from asrt.models.asrt_v4 import ASRTv4, build_asrt_v4
 
 # Non-weight hyperparams that change v4 forward results
@@ -82,12 +83,27 @@ def detect_ckpt_version(state: dict, ckpt_meta: Optional[dict] = None) -> str:
     return 'legacy'
 
 
+def is_irp_cfg(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None) -> bool:
+    cfg = dict(cfg or {})
+    model_cfg = dict(model_cfg or cfg.get('model') or {})
+    name = str(model_cfg.get('name', '')).lower()
+    ver = str(model_cfg.get('version', '')).lower()
+    stage = str(cfg.get('stage', '')).lower()
+    if name in ('asrt_irp_v1', 'asrt_irp', 'irp', 'irp_v1'):
+        return True
+    if ver in ('irp', 'irp_v1', 'vnext', 'vnext_v1'):
+        return True
+    return stage in ('irp', 'irp_v1', 'vnext')
+
+
 def build_model(cfg: Optional[dict] = None, model_cfg: Optional[dict] = None):
-    """Build ASRT / ASRTv3 / ASRTv4 from config dicts."""
+    """Build ASRT / ASRTv3 / ASRTv4 / ASRTIRP from config dicts."""
     cfg = dict(cfg or {})
     model_cfg = dict(model_cfg or cfg.get('model') or {})
     if cfg.get('query_alignment') is not None and 'query_align' not in model_cfg:
         model_cfg['query_align'] = dict(cfg['query_alignment'])
+    if is_irp_cfg(cfg, model_cfg):
+        return build_asrt_irp(dict(cfg, model=model_cfg))
     if is_v4_cfg(cfg, model_cfg):
         return build_asrt_v4(model_cfg)
     return build_asrt(model_cfg)
