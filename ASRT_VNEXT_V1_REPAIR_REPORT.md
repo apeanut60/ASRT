@@ -212,7 +212,7 @@ ASRT_VNEXT_V1_REPAIR_REPORT.md
 
 ### Commit
 
-Filled after `git commit` on `vnext-v1-irp`.
+**Hash:** `f7e86eda67527b226ec811d35a52f656e449ef73`
 
 ### Blockers before claiming Reference Gain
 
