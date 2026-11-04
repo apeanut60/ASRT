@@ -205,7 +205,7 @@ Legacy Stage-A path not re-broken by trainer-only changes (**NOT RUN** full Stag
 
 ## 14. Git
 
-Filled after commit.
+**Hash:** `34c9b69f135838869aeb67f062180fc9e6643af9`
 
 ### Key files
 
