@@ -28,7 +28,11 @@ from asrt.data.irp_dataset import TripletIRPDataset, collate_irp  # noqa: E402
 from asrt.data.manifest import load_manifest  # noqa: E402
 from asrt.data.reference_modes import apply_reference_mode  # noqa: E402
 from asrt.models.asrt_irp import build_asrt_irp  # noqa: E402
-from asrt.training.irp_trainer import IRPTrainer, validate_irp_cfg  # noqa: E402
+from asrt.training.irp_trainer import (  # noqa: E402
+    IRPTrainer,
+    assert_out_dir_safe_for_fresh_start,
+    validate_irp_cfg,
+)
 from asrt.training.seed_utils import seed_everything  # noqa: E402
 
 
@@ -133,6 +137,13 @@ def main():
     if a.resume and (max_steps is None or int(max_steps) <= 0):
         # Resume requires a finite schedule horizon for the cosine scheduler.
         cfg['training']['max_steps'] = int(a.max_steps or 80000)
+    out_dir = Path(cfg.get('out_dir', 'outputs/irp_v1'))
+    if a.resume:
+        # Resume into an existing experiment directory is allowed.
+        cfg['_allow_existing_out_dir'] = True
+    else:
+        # Fail fast before constructing datasets/models if out_dir conflicts.
+        assert_out_dir_safe_for_fresh_start(out_dir, cfg)
     trainer = IRPTrainer(cfg, device=device)
     if a.resume:
         print('resume', a.resume, flush=True)

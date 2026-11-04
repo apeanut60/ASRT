@@ -1,0 +1,76 @@
+# ASRT vNext V1 Formal — A2: Illumination + Low-derived Structural Prior
+# Frozen recipe: seed=42, 80k optimizer updates, effective batch=8, halo auto=32.
+stage: irp_v1
+out_dir: /root/data/experiments/ASRT/vnext_v1/A2_low_prior_seed42
+seed: 42
+model:
+  name: asrt_irp_v1
+  version: irp_v1
+  model_family: asrt_irp
+  n_feats: 64
+  num_res_blocks: "8+8+4+2"
+  enable_lightup: true
+  prior_source: low
+  load_stage_a_checkpoint: false
+  attention:
+    type: window_spatial
+    heads: 4
+    window_size: 8
+  illumination_prior:
+    enabled: true
+    type: low_max_channel
+  reference_prior:
+    enabled: true
+    type: structural_detail
+    gaussian_sigma: 7.0
+    use_highpass: true
+    use_sobel_ref: true
+    use_sobel_low: true
+  irp:
+    coarse: illumination_only
+    middle: dual_prior
+    fine: dual_prior
+    alpha_init: 1.0
+    beta_init: 0.1
+  use_moe: false
+  use_cross_attention: false
+  use_ttsr_matching: false
+training:
+  seed: 42
+  optimizer: adam
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  loss: mse
+  batch_size: 8
+  grad_accum: 1
+  crop_size: 128
+  halo: null
+  amp: true
+  grad_clip: 1.0
+  warmup_steps: 1000
+  max_steps: 80000
+  eta_min: 0.000001
+  val_every: 2000
+  ckpt_every: 2000
+  log_every: 50
+  num_workers: 0
+  drop_last: true
+  device: cuda
+  protocol_version: irp_v1_train_v3
+data:
+  real_low: /root/data/datasets/lol-v2-real/Train/Low
+  real_gt: /root/data/datasets/lol-v2-real/Train/Normal
+  real_ref: /root/data/datasets/lol-v2-real/Train/nanobanana_ref_v2
+  manifest_root: /root/data/experiments/ASRT/manifests
+  train_manifest: lolv2_real_triplet_train.json
+  val_manifest: lolv2_real_triplet_dev.json
+  ref_mode: correct
+evaluation:
+  inference_mode: full
+  full_max_side: 100000
+  tile: 256
+  overlap: 32
+  irp_allow_tiled: false
+  irp_oom_policy: error
+  input_range: minus_one_one

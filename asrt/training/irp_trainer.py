@@ -68,6 +68,83 @@ def git_meta(repo: Optional[str] = None) -> dict:
     return meta
 
 
+def experiment_identity(cfg: dict) -> dict:
+    """Fields that must match for safe reuse of an out_dir."""
+    model = dict(cfg.get('model') or {})
+    tr = dict(cfg.get('training') or {})
+    data = dict(cfg.get('data') or {})
+    git = git_meta()
+    return dict(
+        protocol_version=str(tr.get('protocol_version', PROTOCOL_VERSION)),
+        prior_source=str(model.get('prior_source', '')).lower(),
+        ref_mode=_normalize_ref_mode(data.get('ref_mode', 'correct')),
+        seed=int(tr.get('seed', cfg.get('seed', 42))),
+        max_steps=int(tr.get('max_steps') or 0),
+        batch_size=int(tr.get('batch_size', 8)),
+        grad_accum=max(1, int(tr.get('grad_accum', tr.get('accumulate', 1)))),
+        crop_size=int(tr.get('crop_size', 128)),
+        learning_rate=float(tr.get('learning_rate', tr.get('lr', 1e-4))),
+        train_manifest=str(data.get('train_manifest', '')),
+        val_manifest=str(data.get('val_manifest', '')),
+        git_commit=git.get('git_commit'),
+        git_dirty=git.get('git_dirty'),
+    )
+
+
+def assert_out_dir_safe_for_fresh_start(out_dir: Path, cfg: dict) -> None:
+    """Refuse silent overwrite of an existing formal experiment.
+
+    Fresh start (no --resume) is blocked when the directory already has
+    checkpoints / resolved_config / train_log from a conflicting or
+    in-progress run. Resume must be explicit via --resume.
+    """
+    out_dir = Path(out_dir)
+    resolved = out_dir / 'resolved_config.json'
+    ckpt_dir = out_dir / 'checkpoints'
+    log_path = out_dir / 'train_log.jsonl'
+    has_ckpt = ckpt_dir.is_dir() and any(ckpt_dir.glob('*.pt'))
+    has_resolved = resolved.is_file()
+    has_log = log_path.is_file() and log_path.stat().st_size > 0
+    if not (has_ckpt or has_resolved or has_log):
+        return
+
+    want = experiment_identity(cfg)
+    conflicts = []
+    if has_resolved:
+        try:
+            prev = json.load(open(resolved))
+        except Exception as e:
+            raise RuntimeError(
+                'out_dir %s has unreadable resolved_config.json (%s); '
+                'refuse fresh start (use --resume or a new out_dir)'
+                % (out_dir, e))
+        prev_cfg = dict(prev.get('cfg') or prev)
+        prev_id = experiment_identity(prev_cfg)
+        # Prefer git recorded at previous write if present
+        prev_git = dict(prev.get('git') or {})
+        if prev_git.get('git_commit'):
+            prev_id['git_commit'] = prev_git.get('git_commit')
+            prev_id['git_dirty'] = prev_git.get('git_dirty')
+        for k in ('protocol_version', 'prior_source', 'ref_mode', 'seed',
+                  'max_steps', 'batch_size', 'grad_accum', 'crop_size',
+                  'learning_rate', 'train_manifest', 'val_manifest',
+                  'git_commit'):
+            if prev_id.get(k) != want.get(k):
+                conflicts.append(dict(key=k, existing=prev_id.get(k),
+                                      requested=want.get(k)))
+    if conflicts:
+        raise RuntimeError(
+            'Refuse fresh start in %s: experiment identity mismatch %s. '
+            'Use a new out_dir or --resume with a matching checkpoint.'
+            % (out_dir, conflicts))
+    # Same identity but prior artifacts exist → require explicit resume
+    raise RuntimeError(
+        'Refuse fresh start in %s: existing experiment artifacts found '
+        '(resolved_config=%s checkpoints=%s train_log=%s). '
+        'Pass --resume <checkpoint.pt> to continue, or choose a new out_dir.'
+        % (out_dir, has_resolved, has_ckpt, has_log))
+
+
 def _normalize_ref_mode(mode: str) -> str:
     m = str(mode or 'correct').lower().replace('-', '_')
     if m in ('none', 'no_ref'):
@@ -389,6 +466,9 @@ class IRPTrainer:
                      if _halo is None else int(_halo))
 
         self.out_dir = Path(cfg.get('out_dir', 'outputs/irp_v1'))
+        # Fresh-start overwrite protection (resume path skips via flag).
+        if not bool(cfg.get('_allow_existing_out_dir', False)):
+            assert_out_dir_safe_for_fresh_start(self.out_dir, cfg)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         (self.out_dir / 'checkpoints').mkdir(exist_ok=True)
         self.log_path = self.out_dir / 'train_log.jsonl'
@@ -456,8 +536,36 @@ class IRPTrainer:
         self.git = git_meta()
 
         with open(self.out_dir / 'resolved_config.json', 'w') as f:
-            json.dump(dict(cfg=cfg, train_protocol=self.train_protocol,
-                           git=self.git), f, indent=2)
+            json.dump(dict(
+                cfg=cfg,
+                train_protocol=self.train_protocol,
+                validation_protocol=self.validation_protocol,
+                experiment_identity=experiment_identity(cfg),
+                git=self.git,
+                config_hash=_stable_hash(cfg),
+                train_manifest_hash=self.train_hash,
+                val_manifest_hash=self.val_hash,
+                protocol_version=PROTOCOL_VERSION,
+                halo=self.halo,
+            ), f, indent=2)
+        # Frozen data fingerprints for A2/A3 pairing audits
+        fp = dict(
+            train_manifest_sha256=self.train_hash,
+            val_manifest_sha256=self.val_hash,
+            sample_count=dict(train=len(self.rows_train), val=len(self.rows_val)),
+            sample_id_list=dict(
+                train=[str(r['sample_id']) for r in self.rows_train],
+                val=[str(r['sample_id']) for r in self.rows_val],
+            ),
+            reference_root=str(dict(cfg.get('data') or {}).get('real_ref', '')),
+            prior_source=self.prior_source,
+            ref_mode=self.ref_mode,
+            git=self.git,
+            protocol_version=PROTOCOL_VERSION,
+            config_hash=_stable_hash(cfg),
+        )
+        with open(self.out_dir / 'data_fingerprint.json', 'w') as f:
+            json.dump(fp, f, indent=2)
 
     def _make_loader(self) -> DataLoader:
         nw = int(self.tr.get('num_workers', 0))

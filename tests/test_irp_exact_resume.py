@@ -73,6 +73,30 @@ def _run_interrupted(cfg, split_at=3):
     return tr2, logs2
 
 
+def _assert_opt_state_equal(sa, sb, *, atol, path='opt'):
+    """Recursively compare Adam optimizer state (exp_avg, exp_avg_sq, step, groups)."""
+    if torch.is_tensor(sa) or torch.is_tensor(sb):
+        assert torch.is_tensor(sa) and torch.is_tensor(sb), path
+        assert sa.shape == sb.shape, path
+        assert torch.allclose(sa.cpu().float(), sb.cpu().float(), atol=atol, rtol=1e-5), path
+        return
+    if isinstance(sa, dict):
+        assert isinstance(sb, dict), path
+        assert set(sa.keys()) == set(sb.keys()), (path, set(sa) ^ set(sb))
+        for k in sa:
+            _assert_opt_state_equal(sa[k], sb[k], atol=atol, path='%s.%s' % (path, k))
+        return
+    if isinstance(sa, (list, tuple)):
+        assert isinstance(sb, (list, tuple)) and len(sa) == len(sb), path
+        for i, (xa, xb) in enumerate(zip(sa, sb)):
+            _assert_opt_state_equal(xa, xb, atol=atol, path='%s[%d]' % (path, i))
+        return
+    if isinstance(sa, float) or isinstance(sb, float):
+        assert abs(float(sa) - float(sb)) <= max(atol, 1e-12), path
+        return
+    assert sa == sb, '%s: %r != %r' % (path, sa, sb)
+
+
 def _compare(tr_a, logs_a, tr_b, logs_b, *, atol_param, atol_loss):
     assert tr_a.global_step == tr_b.global_step
     assert len(logs_a) == len(logs_b)
@@ -87,11 +111,9 @@ def _compare(tr_a, logs_a, tr_b, logs_b, *, atol_param, atol_loss):
         max_param = max(max_param, d)
         if d > atol_param:
             raise AssertionError('param %s diff %s > %s' % (n, d, atol_param))
-    # Optimizer / scheduler
-    for k in tr_a.opt.state_dict():
-        va, vb = tr_a.opt.state_dict()[k], tr_b.opt.state_dict()[k]
-        if torch.is_tensor(va):
-            assert torch.allclose(va.cpu(), vb.cpu(), atol=atol_param, rtol=1e-5), k
+    # Full recursive optimizer state (Adam exp_avg / exp_avg_sq / step + param_groups)
+    _assert_opt_state_equal(
+        tr_a.opt.state_dict(), tr_b.opt.state_dict(), atol=atol_param)
     assert tr_a.sched.state_dict()['updates_done'] == tr_b.sched.state_dict()['updates_done']
     return dict(max_param_diff=max_param)
 
@@ -99,9 +121,10 @@ def _compare(tr_a, logs_a, tr_b, logs_b, *, atol_param, atol_loss):
 def test_exact_resume_accum1_cpu():
     with tempfile.TemporaryDirectory() as td:
         synth = make_synthetic_triplet_dataset(os.path.join(td, 'data'), size=160)
-        cfg = _cfg(os.path.join(td, 'u'), synth, accum=1)
-        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg))
-        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg), split_at=3)
+        cfg_u = _cfg(os.path.join(td, 'u'), synth, accum=1)
+        cfg_i = _cfg(os.path.join(td, 'u_int'), synth, accum=1)
+        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg_u))
+        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg_i), split_at=3)
         stats = _compare(tr_a, logs_a, tr_b, logs_b,
                          atol_param=CPU_PARAM_ATOL, atol_loss=CPU_LOSS_ATOL)
         print('accum1', stats)
@@ -110,9 +133,10 @@ def test_exact_resume_accum1_cpu():
 def test_exact_resume_accum2_cpu():
     with tempfile.TemporaryDirectory() as td:
         synth = make_synthetic_triplet_dataset(os.path.join(td, 'data'), size=160)
-        cfg = _cfg(os.path.join(td, 'u2'), synth, accum=2, max_steps=4)
-        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg))
-        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg), split_at=2)
+        cfg_u = _cfg(os.path.join(td, 'u2'), synth, accum=2, max_steps=4)
+        cfg_i = _cfg(os.path.join(td, 'u2_int'), synth, accum=2, max_steps=4)
+        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg_u))
+        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg_i), split_at=2)
         stats = _compare(tr_a, logs_a, tr_b, logs_b,
                          atol_param=CPU_PARAM_ATOL, atol_loss=CPU_LOSS_ATOL)
         print('accum2', stats)
@@ -127,10 +151,12 @@ def test_exact_resume_workers_amp_cuda():
             raise SystemExit('SKIPPED: CUDA not available')
     with tempfile.TemporaryDirectory() as td:
         synth = make_synthetic_triplet_dataset(os.path.join(td, 'data'), size=160)
-        cfg = _cfg(os.path.join(td, 'cu'), synth, accum=1, amp=True, num_workers=2,
-                   max_steps=4, device='cuda')
-        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg))
-        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg), split_at=2)
+        cfg_u = _cfg(os.path.join(td, 'cu'), synth, accum=1, amp=True, num_workers=2,
+                     max_steps=4, device='cuda')
+        cfg_i = _cfg(os.path.join(td, 'cu_int'), synth, accum=1, amp=True, num_workers=2,
+                     max_steps=4, device='cuda')
+        tr_a, logs_a = _run_uninterrupted(copy.deepcopy(cfg_u))
+        tr_b, logs_b = _run_interrupted(copy.deepcopy(cfg_i), split_at=2)
         for la, lb in zip(logs_a, logs_b):
             assert la['sample_ids'] == lb['sample_ids']
             assert la.get('aug_meta') == lb.get('aug_meta')
