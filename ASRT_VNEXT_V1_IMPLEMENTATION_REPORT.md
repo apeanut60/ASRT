@@ -182,7 +182,9 @@ Window attention at full H dominates activation memory; no abnormal OOM on 4090 
 
 ## 16. Git Commit
 
-See commit message after this report is included in the tree (hash filled at commit time).
+- **Hash:** `15e6426f75df85e95e9bf2fc5ef2e5df8108cf8f`
+- **Message:** Add ASRT vNext V1 IRP dual-prior restoration network.
+- **Branch:** `v4` (ahead of `origin/v4`)
 
 ## 17. Reproduce
 
