@@ -1,10 +1,13 @@
 #!/usr/bin/env python
-"""Paired A2/A3 validation comparison + optional A3 reference diagnostics."""
+"""Paired A2/A3 validation comparison + optional A3 reference diagnostics.
+
+Checkpoint loading uses factory.load_checkpoint_strict so prior_source and
+other IRP hparams cannot silently mismatch.
+"""
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -20,14 +23,16 @@ from asrt.data.reference_modes import build_wrong_mapping  # noqa: E402
 from asrt.evaluation.metrics import psnr_ssim_rgb  # noqa: E402
 from asrt.evaluation.protocol import infer_with_protocol, resolve_eval_cfg  # noqa: E402
 from asrt.models.asrt_irp import build_asrt_irp  # noqa: E402
+from asrt.models.factory import load_checkpoint_strict  # noqa: E402
 from asrt.training.irp_trainer import _load_rows  # noqa: E402
 
 
 def _bootstrap_ci(deltas, n_boot=2000, seed=0):
+    """Bootstrap over *images* (paired deltas), not over training checkpoints."""
     rng = np.random.RandomState(seed)
     deltas = np.asarray(deltas, dtype=np.float64)
     if len(deltas) == 0:
-        return dict(mean=None, ci95=(None, None))
+        return dict(mean=None, ci95=(None, None), median=None)
     means = []
     for _ in range(n_boot):
         sample = rng.choice(deltas, size=len(deltas), replace=True)
@@ -37,13 +42,20 @@ def _bootstrap_ci(deltas, n_boot=2000, seed=0):
                 median=float(np.median(deltas)))
 
 
-def _load_model(cfg_path, ckpt_path, device):
+def _load_model(cfg_path, ckpt_path, device, expect_prior=None):
     cfg = yaml.safe_load(open(cfg_path))
+    if expect_prior is not None:
+        got = str(cfg['model']['prior_source']).lower()
+        if got != str(expect_prior).lower():
+            raise RuntimeError(
+                'config prior_source=%r does not match expect %r' % (got, expect_prior))
     model = build_asrt_irp(cfg).to(device)
-    ck = torch.load(ckpt_path, map_location='cpu')
-    model.load_state_dict(ck['model'], strict=True)
+    report = load_checkpoint_strict(
+        model, ckpt_path, device='cpu', expect_version='irp_v1',
+        external_cfg=cfg, allow_hparam_override=False)
     model.eval()
-    return model, cfg, ck
+    ck = torch.load(ckpt_path, map_location='cpu')
+    return model, cfg, ck, report
 
 
 @torch.no_grad()
@@ -63,8 +75,10 @@ def eval_rows(model, rows, cfg, device, ref_mode='correct', wrong_map=None):
         ref = b['ref']
         if ref is not None:
             ref = ref[None].to(device)
-        pred, meta = infer_with_protocol(model, low, ref, ev)
-        # metrics expect [-1,1] RGB
+        if ref_mode == 'noref':
+            pred, meta = infer_with_protocol(model, low, None, cfg)
+        else:
+            pred, meta = infer_with_protocol(model, low, ref, cfg)
         m = psnr_ssim_rgb(pred, gt, input_range=str(ev.get('input_range', 'minus_one_one')))
         out.append(dict(
             sample_id=str(b['sample_id']),
@@ -87,8 +101,8 @@ def main():
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    m2, cfg2, ck2 = _load_model(a.a2_cfg, a.a2_ckpt, a.device)
-    m3, cfg3, ck3 = _load_model(a.a3_cfg, a.a3_ckpt, a.device)
+    m2, cfg2, ck2, rep2 = _load_model(a.a2_cfg, a.a2_ckpt, a.device, expect_prior='low')
+    m3, cfg3, ck3, rep3 = _load_model(a.a3_cfg, a.a3_ckpt, a.device, expect_prior='nano')
     rows = _load_rows(cfg3, 'val')
     r2 = eval_rows(m2, rows, cfg2, a.device, ref_mode='correct')
     r3 = eval_rows(m3, rows, cfg3, a.device, ref_mode='correct')
@@ -107,7 +121,7 @@ def main():
     dpsnr = [p['Delta_PSNR'] for p in paired]
     boot = _bootstrap_ci(dpsnr)
     summary = dict(
-        n=len(paired),
+        n_images=len(paired),
         mean_a2_psnr=float(np.mean([p['A2_PSNR'] for p in paired])),
         mean_a3_psnr=float(np.mean([p['A3_PSNR'] for p in paired])),
         mean_a2_ssim=float(np.mean([p['A2_SSIM'] for p in paired])),
@@ -115,15 +129,17 @@ def main():
         mean_delta_psnr=boot['mean'],
         median_delta_psnr=boot['median'],
         bootstrap_ci95_delta_psnr=boot['ci95'],
+        bootstrap_unit='validation_images',
         positive_delta_ratio=float(np.mean([d > 0 for d in dpsnr])),
         negative_delta_ratio=float(np.mean([d < 0 for d in dpsnr])),
         worst10_negative=sorted(paired, key=lambda x: x['Delta_PSNR'])[:10],
         a2_ckpt=a.a2_ckpt, a3_ckpt=a.a3_ckpt,
         a2_global_step=ck2.get('global_step'), a3_global_step=ck3.get('global_step'),
+        a2_load_report=rep2, a3_load_report=rep3,
     )
     with open(out / 'paired_val_metrics.json', 'w') as f:
-        json.dump(dict(summary=summary, per_image=paired), f, indent=2)
-    print(json.dumps(summary, indent=2))
+        json.dump(dict(summary=summary, per_image=paired), f, indent=2, default=str)
+    print(json.dumps({k: summary[k] for k in summary if 'report' not in k}, indent=2))
 
     if a.diagnostics:
         ids = [str(r['sample_id']) for r in rows]
@@ -137,7 +153,6 @@ def main():
                 wrong_map=wmap if mode == 'wrong' else None)
             print('diag', mode,
                   float(np.mean([x['psnr'] for x in diag[mode]])), flush=True)
-        # paired deltas vs correct
         by_c = {x['sample_id']: x for x in diag['correct']}
         deltas = {}
         for mode in modes:

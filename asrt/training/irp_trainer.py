@@ -45,6 +45,27 @@ from asrt.training.seed_utils import (
 PROTOCOL_VERSION = 'irp_v1_train_v3'
 
 
+def split_irp_gate_params(model) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter], List[str]]:
+    """Partition trainable params into IRP scalar gates (alpha/beta) vs the rest.
+
+    Returns (gate_params, other_params, gate_names). Each trainable parameter
+    appears in exactly one of the two lists.
+    """
+    gate_params: List[torch.nn.Parameter] = []
+    other_params: List[torch.nn.Parameter] = []
+    gate_names: List[str] = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        leaf = name.rsplit('.', 1)[-1]
+        if leaf in ('alpha', 'beta'):
+            gate_params.append(p)
+            gate_names.append(name)
+        else:
+            other_params.append(p)
+    return gate_params, other_params, gate_names
+
+
 def _stable_hash(obj: Any) -> str:
     blob = json.dumps(obj, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
@@ -437,11 +458,34 @@ class IRPTrainer:
         lr = float(tr.get('learning_rate', tr.get('lr', 1e-4)))
         wd = float(tr.get('weight_decay', 1e-4))
         betas = tuple(tr.get('betas', (0.9, 0.999)))
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        if opt_name in ('adamw',):
-            self.opt = torch.optim.AdamW(params, lr=lr, betas=betas, weight_decay=wd)
+        # Optional separate Adam group for IRP scalar gates (alpha/beta).
+        # When gate_lr/gate_weight_decay match base (or are unset), use a single
+        # param group — bit-equivalent to the original V1 Adam setup (B0).
+        gate_lr = tr.get('gate_lr', None)
+        gate_wd = tr.get('gate_weight_decay', None)
+        gate_lr = float(lr if gate_lr is None else gate_lr)
+        gate_wd = float(wd if gate_wd is None else gate_wd)
+        gate_params, other_params, gate_names = split_irp_gate_params(self.model)
+        self.gate_param_names = list(gate_names)
+        self.gate_lr = gate_lr
+        self.gate_weight_decay = gate_wd
+        use_split = (
+            abs(gate_lr - lr) > 1e-15 or abs(gate_wd - wd) > 1e-15
+        ) and len(gate_params) > 0
+        opt_cls = torch.optim.AdamW if opt_name in ('adamw',) else torch.optim.Adam
+        if use_split:
+            self.opt = opt_cls(
+                [
+                    dict(params=other_params, lr=lr, weight_decay=wd),
+                    dict(params=gate_params, lr=gate_lr, weight_decay=gate_wd),
+                ],
+                betas=betas,
+            )
+            self.opt_param_groups_mode = 'split_gates'
         else:
-            self.opt = torch.optim.Adam(params, lr=lr, betas=betas, weight_decay=wd)
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            self.opt = opt_cls(params, lr=lr, betas=betas, weight_decay=wd)
+            self.opt_param_groups_mode = 'single_v1_equivalent'
 
         self.max_steps = int(tr.get('max_steps') or 0)
         if self.max_steps <= 0:
@@ -650,16 +694,30 @@ class IRPTrainer:
     def _grad_norms(self) -> dict:
         total = 0.0
         ref_branch = 0.0
+        illum_branch = 0.0
+        gate_alpha = 0.0
+        gate_beta = 0.0
         for name, p in self.model.named_parameters():
             if p.grad is None:
                 continue
             g = float(p.grad.data.float().norm().item())
             total += g * g
+            leaf = name.rsplit('.', 1)[-1]
+            if leaf == 'alpha':
+                gate_alpha += g * g
+            elif leaf == 'beta':
+                gate_beta += g * g
             if 'attn_ref' in name or 'ref_projection' in name or 'ref_prior' in name:
                 ref_branch += g * g
+            if ('attn_illum' in name or 'illum_projection' in name
+                    or 'illum_prior' in name):
+                illum_branch += g * g
         return dict(
             gradient_norm=math.sqrt(total),
             reference_branch_grad_norm=math.sqrt(ref_branch),
+            illum_branch_grad_norm=math.sqrt(illum_branch),
+            gate_alpha_grad_norm=math.sqrt(gate_alpha),
+            gate_beta_grad_norm=math.sqrt(gate_beta),
         )
 
     def _alpha_beta(self) -> dict:
@@ -740,6 +798,9 @@ class IRPTrainer:
             did_optimizer_step=did_step,
             sample_ids=sample_ids,
             aug_meta=aug_metas,
+            gate_lr=float(self.gate_lr),
+            gate_weight_decay=float(self.gate_weight_decay),
+            opt_param_groups_mode=getattr(self, 'opt_param_groups_mode', 'single'),
             **self._alpha_beta(),
             **grad_info,
             pred_min=last_aux.get('pred_min'),

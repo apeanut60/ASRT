@@ -65,8 +65,19 @@ class ASRTIRP(nn.Module):
         self.last_aux = None
         self.irp_hparams = extract_irp_hparams_from_model(self)
 
-    def forward(self, low, ref=None, return_aux: bool = False):
-        out = self.backbone(low, ref=ref, return_aux=return_aux)
+    def forward(
+        self,
+        low,
+        ref=None,
+        return_aux: bool = False,
+        disable_reference: bool = False,
+        collect_branch_stats: bool = False,
+    ):
+        out = self.backbone(
+            low, ref=ref, return_aux=return_aux,
+            disable_reference=disable_reference,
+            collect_branch_stats=collect_branch_stats,
+        )
         if return_aux:
             pred, aux = out
             self.last_aux = aux

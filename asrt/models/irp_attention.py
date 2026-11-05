@@ -172,7 +172,15 @@ class IRPTransformerBlock(nn.Module):
         feature: torch.Tensor,
         illumination_prior: torch.Tensor,
         reference_prior: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        *,
+        return_aux: bool = False,
+        disable_reference: bool = False,
+    ):
+        """Forward. Optional diagnostics do not change default math when flags are off.
+
+        disable_reference: skip adding beta*ref_mod (diagnostic only; weights unchanged).
+        return_aux: also return scalar branch-contribution proxies.
+        """
         if illumination_prior.shape[-2:] != feature.shape[-2:]:
             illumination_prior = F.interpolate(
                 illumination_prior, size=feature.shape[-2:],
@@ -180,17 +188,50 @@ class IRPTransformerBlock(nn.Module):
         f = self.norm1(feature)
         illum_feat = self.attn_illum(f)
         illum_mod = illum_feat * self.illum_projection(illumination_prior)
-        fused = self.alpha * illum_mod
+        alpha_illum = self.alpha * illum_mod
+        fused = alpha_illum
 
-        if self.use_reference and reference_prior is not None and self.attn_ref is not None:
+        ref_mod = None
+        beta_ref = None
+        used_ref = False
+        if (self.use_reference and reference_prior is not None
+                and self.attn_ref is not None and not disable_reference):
             if reference_prior.shape[-2:] != feature.shape[-2:]:
                 reference_prior = F.interpolate(
                     reference_prior, size=feature.shape[-2:],
                     mode='bilinear', align_corners=False)
             ref_feat = self.attn_ref(f)
             ref_mod = ref_feat * torch.tanh(self.ref_projection(reference_prior))
-            fused = fused + self.beta * ref_mod
+            beta_ref = self.beta * ref_mod
+            fused = fused + beta_ref
+            used_ref = True
 
         x = feature + self.output_projection(fused)
         x = x + self.ffn(self.norm2(x))
-        return x
+
+        if not return_aux:
+            return x
+
+        eps = 1e-12
+        with torch.no_grad():
+            c_i = float(alpha_illum.detach().float().norm().item())
+            c_r = float(beta_ref.detach().float().norm().item()) if beta_ref is not None else 0.0
+            f_l2 = float(feature.detach().float().norm().item())
+            aux = dict(
+                alpha=float(self.alpha.detach().item()),
+                beta=(float(self.beta.detach().item())
+                      if self.beta is not None else None),
+                illum_mod_l2=float(illum_mod.detach().float().norm().item()),
+                ref_mod_l2=(float(ref_mod.detach().float().norm().item())
+                            if ref_mod is not None else 0.0),
+                alpha_illum_mod_l2=c_i,
+                beta_ref_mod_l2=c_r,
+                fused_l2=float(fused.detach().float().norm().item()),
+                feature_l2=f_l2,
+                illum_contribution_ratio=c_i / (c_i + c_r + eps),
+                ref_contribution_ratio=c_r / (c_i + c_r + eps),
+                eta_R=c_r / (f_l2 + eps),
+                used_reference_branch=used_ref,
+                disable_reference=bool(disable_reference),
+            )
+        return x, aux
